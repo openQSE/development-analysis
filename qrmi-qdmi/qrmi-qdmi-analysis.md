@@ -361,15 +361,125 @@ programs are lowered into portable exchange payloads.
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
 
+The QRMI path carries the provider-native IQM calibration payload through the
+interface boundary. In QFw, the QRMI shim driver calls
+`self._qpu().target().value`, parses that JSON once, and caches it in
+`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py:175-186`.
+`get_calibration_snapshot()` then passes the QRMI target sections directly into
+`qhw_iqm.normalize_calibration`: `dynamic_quantum_architecture` becomes
+`dynamic_architecture`, `calibration_set` is passed through as `calibration_set`,
+and `quality_metrics` is passed through as `quality_metric_set`
+(`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py:212-226`).
+
+The underlying QRMI Python binding maps
+`QuantumResource(..., ResourceType.IQMServer)` to the Rust `IQMServer`
+implementation (`qrmi/src/pyext.rs:102-107`) and exposes `.target()` by calling
+`self.qrmi.target().await` (`qrmi/src/pyext.rs:226-231`). The IQM server
+implementation builds one JSON object containing the full responses from:
+
+- `get_dynamic_quantum_architecture_v1`, stored under
+  `dynamic_quantum_architecture` (`qrmi/src/iqm/server.rs:236-251`)
+- `get_calibration_set_v1`, stored under `calibration_set`
+  (`qrmi/src/iqm/server.rs:253-268`)
+- `get_quality_metrics_v1`, stored under `quality_metrics`
+  (`qrmi/src/iqm/server.rs:270-285`)
+
+Those generated IQM client calls hit the direct calibration-set endpoints:
+`/api/v1/calibration-sets/{qc}/{cal_set}`,
+`/api/v1/calibration-sets/{qc}/{cal_set}/dynamic-quantum-architecture`, and
+`/api/v1/calibration-sets/{qc}/{cal_set}/metrics`
+(`qrmi/dependencies/iqm_client/src/apis/calibration_sets_api.rs:66-71`,
+`qrmi/dependencies/iqm_client/src/apis/calibration_sets_api.rs:112-117`, and
+`qrmi/dependencies/iqm_client/src/apis/calibration_sets_api.rs:159-164`).
+
+After QRMI returns the target JSON, `qhw-iqm` normalizes it without doing the
+QDMI-style metric down-select. `normalize_calibration()` reads the full
+`calibration_set` and `quality_metric_set` objects, counts their observations,
+and places the IQM observation sets under `extensions["iqm.v1"]`
+(`qhw-iqm/src/qhw_iqm/normalize.py:138-157` and
+`qhw-iqm/src/qhw_iqm/normalize.py:174-219`). `_iqm_observation_set()` preserves
+the observation-set identity fields and the full `observations` arrays
+(`qhw-iqm/src/qhw_iqm/normalize.py:444-460`). At the raw QRMI `target()` layer,
+the complete endpoint JSON objects are available; at the qhw-normalized layer,
+the full calibration and quality observation arrays remain available for
+downstream analysis.
+
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+The QDMI path does not pass the full IQM observation sets through Python. QFw
+opens the IQM QDMI shared library through MQT Core's FoMaC loader in
+`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py:89-119` and serves
+`get_calibration_snapshot()` by calling
+`fomac_normalize.extract_calibration(self._device())` in
+`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py:145-152`. The QFw extractor
+can only ask the FoMaC/QDMI object for standardized accessors: per-site
+`t1()`/`t2()`, per-operation `fidelity()`/`duration()`, and the device duration
+unit (`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:47-78` and
+`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:243-271`). The normalized
+record then stores only `qubit_metrics`, `gate_metrics`, and `duration_unit`
+under `extensions["qdmi.fomac.v1"]`
+(`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:123-164`).
+
+The down-select happens inside QDMI-on-IQM before QFw sees the data. The IQM
+device session stores only site identity plus `t1_`/`t2_` and operation fidelity
+maps (`QDMI-on-IQM/src/iqm_device.cpp:104-137` and
+`QDMI-on-IQM/src/iqm_device.cpp:205-210`). QDMI-on-IQM does fetch the IQM
+quality-metrics endpoint (`QDMI-on-IQM/src/internal/iqm_api_config.cpp:47-50`
+and `QDMI-on-IQM/src/iqm_device.cpp:460-470`), but it immediately flattens
+valid observations into a `dut_field -> value` map
+(`QDMI-on-IQM/src/iqm_device.cpp:479-488`) and extracts only:
+
+- `characterization.model.<qubit>.t1_time` into `site->t1_`
+  (`QDMI-on-IQM/src/iqm_device.cpp:490-496`)
+- `characterization.model.<qubit>.t2_time` into `site->t2_`
+  (`QDMI-on-IQM/src/iqm_device.cpp:497-502`)
+- `metrics.ssro.measure.<impl>.<qubit>.fidelity`
+  (`QDMI-on-IQM/src/iqm_device.cpp:508-521`)
+- `metrics.rb.prx.<impl>.<qubit>.fidelity:par=d2`
+  (`QDMI-on-IQM/src/iqm_device.cpp:524-538`)
+- `metrics.irb.cz.<impl>.<q1>__<q2>.fidelity:par=d2`
+  (`QDMI-on-IQM/src/iqm_device.cpp:541-557`)
+
+The public query functions then expose only the implemented QDMI properties:
+site index/name/T1/T2 and operation name/qubit count/parameter count/sites plus
+fidelity when a mapped fidelity exists
+(`QDMI-on-IQM/src/iqm_device.cpp:1659-1685` and
+`QDMI-on-IQM/src/iqm_device.cpp:1688-1791`). Although QDMI has an operation
+duration property in the standard, QDMI-on-IQM documents that IQM operation
+durations are not currently supported (`QDMI-on-IQM/docs/usage.md:194-201`).
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+QRMI currently acts as a provider-native data transport for IQM target data:
+downstream code can receive the dynamic architecture, calibration set, and full
+quality-metric observation arrays. QDMI-on-IQM currently acts as a standardized
+property projection: it fetches the IQM quality-metrics response but exposes
+only the fields it maps into QDMI properties. In the current QFw/QDMI path,
+Python sees T1/T2 and selected measure/prx/cz fidelities, not the original IQM
+observation objects.
+
+That means the statement "a script that needs to analyze calibration data in
+detail currently cannot do that with QDMI" is true for the code inspected here.
+Such a script can use QDMI for the mapped metrics: per-qubit T1/T2 and selected
+gate fidelities. It cannot use QDMI to inspect the full IQM calibration data set:
+unmapped `dut_field` entries, readout error components such as
+`error_0_to_1`/`error_1_to_0`, `t2_echo_time`, observation IDs, timestamps,
+units, uncertainty, invalid flags, and other provider-native observation fields
+are not available after QDMI-on-IQM's down-select. They are dropped before the
+QFw FoMaC adapter builds its `qdmi.fomac.v1` record.
+
+This limits applications that need deeper calibration analysis. Any analysis
+that depends on the complete IQM observation set must currently use the QRMI
+path, the native IQM path, or a new QDMI extension that exposes raw calibration
+and quality-metric observation sets. The current QDMI path is appropriate for
+portable device-property queries, but not for detailed provider-native
+calibration analytics.
 
 </details>
 
