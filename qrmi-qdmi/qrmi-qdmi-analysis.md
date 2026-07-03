@@ -1,458 +1,493 @@
 # QRMI And QDMI Comparison
 
-This document captures the QRMI and QDMI comparison being performed through
-the QFw shim QPM service. The goal is to compare the two interfaces as active
-implementations behind one QPM-facing contract. The comparison is anchored in
-the current QFw work, where `svc_lib_qpm` can route selected QPM calls to QRMI
-or QDMI and return the observed behavior through the same client-side test.
+This document captures the QRMI and QDMI comparison being performed with the
+QFw shim QPM service as the test vehicle. The goal is to compare the public
+runtime and resource interfaces exposed by QRMI and QDMI, then use QFw tests to
+observe how those interfaces behave when placed behind one QPM-facing contract.
 
 The comparison follows the API-category direction discussed in
-`openQSE/openqse-spec` discussion 31. A quantum resource interface should not
-be treated as one monolithic API. It has several consumers, including
-applications, resource managers, schedulers, operators, monitoring services,
-and authentication services. Each consumer needs a different part of the
-interface. The comparison below uses those functional blocks as the primary
-axes.
+`openQSE/openqse-spec` discussion 31. A quantum resource interface has several
+consumers. Applications, resource managers, schedulers, operators, monitoring
+services, and authentication services do not need the same calls. The axes below
+split the interface by function so each category can be evaluated on its own.
 
-## Summary Table
+## Comparison Axes
 
-| Comparison axis | QRMI behavior in current QFw shim | QDMI behavior in current QFw shim |
+This table defines the comparison axes. It describes what each axis means and
+why the behavior matters. The QRMI and QDMI behavior for each axis is recorded
+in the detailed sections that follow.
+
+| Axis | Meaning | Why it matters |
 |---|---|---|
-| Interface role and scope | Acts as the execution and reservation-oriented path. QFw treats it as the execution owner for the shim resource. | Acts as the device-introspection path. QFw routes selected device and calibration queries through QDMI/FoMaC. |
-| Device discovery and capability advertisement | Exposes enough target data for device introspection through `QuantumResource.target()`. QFw currently uses a static descriptor to advertise QRMI coverage. | Exposes device structure through QDMI/FoMaC query objects. QFw currently uses the same static descriptor to advertise QDMI coverage. |
-| Admission | Not yet exposed as a QFw-tested API category in the shim path. QRMI is closer to this layer because it owns resource-management concepts. | Not yet exposed as a QFw-tested API category in the shim path. QDMI is currently used for device queries rather than admission decisions. |
-| Admission control configuration | Not currently implemented in the QFw shim path. | Not currently implemented in the QFw shim path. |
-| Device scheduler control | Not currently implemented in the QFw shim path. | Not currently implemented in the QFw shim path. |
-| Runtime submission | Wired as the execution owner. `async_run` routes circuit execution to QRMI in the descriptor. | Not wired for runtime submission in the current descriptor. |
-| Job lifecycle and results | Intended owner for status, result retrieval, timing, and metadata after submission. The current shim test exercises `async_run` and `get_last_job_metadata`. | Not currently the job lifecycle owner in QFw. |
-| Device introspection | Uses QRMI target data, then normalizes IQM-native data through `qhw-iqm`. | Uses QDMI/FoMaC device objects, then normalizes extracted topology through `qhw-data` builders. |
-| Calibration and quality data | QRMI target data appears to carry IQM dynamic architecture, calibration set, and quality metrics. QFw currently wires only part of this path. | QDMI-on-IQM fetches IQM calibration quality metrics internally and exposes selected data through FoMaC properties. QFw currently has only partial binding for calibration snapshots. |
-| Telemetry | Not yet separated as a QFw shim API category. Some execution timing can be inferred from QFw result metadata and QRMI job metadata once implemented. | Not yet separated as a QFw shim API category. Device health and status are available through QDMI properties, but QFw does not yet expose a telemetry API. |
-| Device authentication | Uses endpoint and token environment variables or shared QFw device-access config to initialize the QRMI IQM resource path. | Uses the same QFw endpoint and token sources to initialize the QDMI-on-IQM FoMaC device session. |
-| Control-plane authorization | Not implemented. No protected operator-facing control API exists in the current QFw shim. | Not implemented. No protected operator-facing control API exists in the current QFw shim. |
-| Data normalization | Normalizes IQM-native target data through `qhw-iqm`, then returns `qhw-data` records. | Normalizes the FoMaC-extracted representation directly with `qhw-data`. The lower QDMI-on-IQM layer receives IQM JSON internally, but QFw does not currently consume that raw JSON. |
-| Program representation and placement | Current QFw smoke path sends OpenQASM through `async_run`. QRMI execution binding remains the intended route for circuit execution and placement behavior. | QDMI-on-IQM supports IQM JSON and QIR-style job parameters internally, including qubit mapping parameters. QFw does not currently route smoke execution through QDMI. |
-| Error model | Errors propagate through QFw/DEFw exceptions and shim result dictionaries. Library-specific error normalization is not yet defined. | Errors also propagate through QFw/DEFw exceptions. QDMI-specific status codes are hidden behind FoMaC/Python exceptions in the current QFw path. |
-| Extensibility and versioning | Coverage is expressed in the QFw shim descriptor. API-level versioning is not yet split into independent specs. | Coverage is expressed in the same QFw shim descriptor. QDMI can implement more categories without requiring QFw to treat the interface as monolithic. |
+| Interface role and scope | The part of the quantum resource stack the interface is trying to own. | Establishes whether the interface targets applications, resource managers, device providers, schedulers, or multiple layers. |
+| Device discovery and capability advertisement | How devices, supported calls, supported formats, and resource capabilities are exposed. | Allows software above the interface to decide which device or implementation can satisfy a request. |
+| Admission | The resource-manager-facing decision path for accepting, delaying, or rejecting quantum resource requests. | Prevents uncontrolled oversubscription and gives site schedulers a device-aware admission decision. |
+| Admission control configuration | The operator-facing controls used to select and tune admission policy. | Lets a site configure quality of service, allocation limits, rate limits, credit policy, and other admission behavior. |
+| Device scheduler control | The operator-facing controls used to configure local device scheduling policy. | Allows a site to choose how accepted quantum tasks are ordered before they reach the QPU. |
+| Runtime submission | The application-facing path for submitting quantum work for execution. | Defines the execution model, accepted payloads, async behavior, and the boundary between portable API and provider-specific job format. |
+| Job lifecycle and results | The calls used to track status, cancel jobs, collect results, retrieve metadata, and inspect errors. | Keeps execution state and result handling consistent across providers and adapters. |
+| Device introspection | Device identity, qubits, operations, topology, supported loci, and backend properties. | Supplies the information needed for placement, validation, compilation, scheduling, and reporting. |
+| Calibration and quality data | Calibration set identity, quality metrics, fidelity data, coherence data, validity, and provenance. | Makes device quality visible to applications, schedulers, and monitoring tools. |
+| Telemetry | Runtime health, load, queue state, availability, timing, and operational counters. | Supports observability and dynamic runtime policy decisions. |
+| Device authentication | The mechanism used to authenticate to the quantum hardware provider. | Determines how credentials are obtained, scoped, injected, used, and revoked. |
+| Control-plane authorization | The mechanism used to authorize protected service-control calls. | Separates user execution rights from privileged operations such as policy changes and credential injection. |
+| Data normalization | Conversion from provider-native or interface-native payloads into common records. | Allows downstream software to consume device, calibration, telemetry, and result data without provider-specific parsing. |
+| Program representation and placement | The accepted program formats, execution options, and logical-to-physical placement representation. | Determines whether applications can submit portable programs and whether placement intent survives to the provider. |
+| Error model | How errors, return codes, provider failures, and retryability are represented. | Enables consistent diagnostics and prevents every caller from handling library-specific failures differently. |
+| Extensibility and versioning | How the interface grows, advertises optional features, and preserves compatibility. | Allows independent API categories and provider implementations to evolve without treating the whole interface as one monolith. |
+
+## Interface Role And Scope
 
 <details>
-<summary><strong>Interface Role And Scope</strong></summary>
-
-The current QFw shim treats QRMI and QDMI as two lower-level implementations
-behind one QPM-facing service. The QPM client does not import either library
-directly. It discovers the shim QPM through the QFw resource manager, connects
-to that service, and calls the `api_qpm` methods.
-
-QRMI is currently the execution owner in the shim descriptor. This matches the
-direction of QRMI as a resource-management interface. The QFw path uses QRMI
-for the execution-family calls because those calls need one owner for
-submission, status, metadata, and results.
-
-QDMI is currently used as a device-introspection path. QDMI-on-IQM opens a
-device session, queries the IQM backend, and exposes the device through the
-FoMaC object model. QFw then reads that model and builds normalized device and
-coupling records.
-
-The unification path is a QPM-facing contract split into functional API
-categories. QRMI and QDMI can implement different subsets. QFw should route by
-capability and by resource descriptor instead of assuming that one library owns
-the whole quantum resource interface.
+<summary><strong>QRMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Device Discovery And Capability Advertisement</strong></summary>
-
-The current QFw comparison relies on a static per-resource descriptor in
-`services/svc_lib_qpm/descriptor.py`. For `ornl-iqm-20q`, the descriptor wires
-both `qrmi` and `qdmi`, sets QDMI as the introspection preference, and sets
-QRMI as the execution owner.
-
-QRMI coverage currently includes device information, coupling graph,
-backend information, circuit execution, job timing, and job metadata. The
-implemented QRMI driver path is strongest for `get_device_info` and
-`get_coupling_graph`, where it reads `QuantumResource.target()` and passes the
-IQM-native payload into `qhw-iqm`.
-
-QDMI coverage currently includes device information, coupling graph, backend
-information, dynamic backend information, and calibration snapshot. The
-implemented QDMI driver path is strongest for `get_device_info` and
-`get_coupling_graph`, where it reads the FoMaC device object.
-
-The unification path is dynamic capability advertisement. A device service
-should advertise which API categories it implements, which data formats it can
-return, and which calls are complete enough for production use. Static
-descriptors are useful during the QFw comparison phase, but the final interface
-should let the service report this coverage directly.
+<summary><strong>QDMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Admission</strong></summary>
+<summary><strong>Comparison Analysis</strong></summary>
 
-Admission is the resource-manager-facing decision path. A site scheduler or
-resource manager asks whether a proposed job can receive access to a quantum
-device. The request needs enough information for the device-side policy to
-estimate capacity. Useful inputs include expected circuit count, qubit count,
-depth, shot count, one-qubit gate count, two-qubit gate count, and expected
-runtime.
+</details>
 
-The current QFw shim does not expose admission as a QRMI or QDMI test axis.
-QRMI is conceptually closer to this layer because it already targets resource
-management. QDMI is currently focused on device representation and submission
-mechanics.
+## Device Discovery And Capability Advertisement
 
-The unification path is a separate `api_admission` category. It should return
-a structured decision that a SLURM, Flux, QRMI, SPANK, GRES, or HRES
-integration can translate into its own reservation lifecycle. The decision
-should distinguish accepted, rejected, delayed, and accepted-with-limits cases.
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Admission Control Configuration</strong></summary>
-
-Admission control configuration is an operator-facing API category. It selects
-and tunes the device admission policy. Examples include unlimited admission,
-rate-limited admission, time-credit admission, account limits, reservation
-limits, and site-specific policy modules.
-
-Neither QRMI nor QDMI exposes this through the current QFw shim. The QFw
-prototype also does not yet define the protected control API required to
-configure admission policy safely.
-
-The unification path is a separate `api_admission_control` category. It should
-be callable by trusted site automation, not by ordinary application code.
-Authentication and authorization for this API should be handled separately from
-device authentication.
+<summary><strong>QDMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Device Scheduler Control</strong></summary>
+<summary><strong>Comparison Analysis</strong></summary>
 
-Device scheduler control configures the local QPU scheduling policy. It is
-used by site operators or trusted automation to select policies such as FIFO,
-priority, round robin, shortest job first, longest job first, shot slicing, or
-deadline-aware scheduling.
+</details>
 
-The current QFw shim does not expose scheduler control through QRMI or QDMI.
-The existing QPM execution path accepts work through `sync_run` or `async_run`.
-Any device scheduling policy should live behind those calls rather than
-requiring applications to pick the next task.
+## Admission
 
-The unification path is a protected scheduler-control API. It should configure
-the local scheduler and expose queue inspection. Execution calls remain simple
-for applications. They submit work. The service schedules the work according
-to the configured policy.
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Runtime Submission</strong></summary>
-
-Runtime submission is the application-facing execution path. In QFw, this is
-represented by QPM calls such as `async_run(info)` and `sync_run(info)`. The
-current shim smoke test uses `async_run` with a small OpenQASM circuit.
-
-QRMI is the current execution owner. The descriptor routes `run_circuit`,
-`get_last_job_timing`, and `get_last_job_metadata` to QRMI. This makes QRMI the
-path that should own job submission and subsequent execution-family state.
-
-QDMI execution is not enabled in the current QFw descriptor. QDMI-on-IQM does
-contain job submission logic internally. It can construct an IQM job payload,
-include calibration set ID, shot count, execution options, and qubit mapping,
-and submit that payload to IQM. The QFw shim has not yet exposed that as the
-runtime owner.
-
-The unification path is a common runtime API category. It should define the
-submission envelope, accepted program formats, execution options, placement
-hints, async completion behavior, and result retrieval contract. QRMI and QDMI
-can then be compared by running the same QFw runtime test through each path
-when both support execution.
+<summary><strong>QDMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Job Lifecycle And Results</strong></summary>
+<summary><strong>Comparison Analysis</strong></summary>
 
-Job lifecycle includes status, cancellation, completion, result retrieval,
-execution timing, provider metadata, and errors. In the QFw shim, this is tied
-to the execution owner because stateful job calls must follow the same lower
-library that submitted the job.
+</details>
 
-QRMI is the current owner for this area. The smoke test registers a completion
-callback, calls `async_run`, waits for a result event, and can then call
-`get_last_job_metadata`.
+## Admission Control Configuration
 
-QDMI is not currently the job lifecycle owner in QFw. Its C++ implementation
-can submit jobs and query IQM job results internally, but the QFw shim does
-not route job lifecycle calls to QDMI.
-
-The unification path is to define lifecycle results independently from the
-submission mechanism. The normalized result should separate user-visible
-counts, timing, provider metadata, raw provider payload when requested, and
-error details.
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Device Introspection</strong></summary>
-
-Device introspection covers device identity, qubits, connectivity, operations,
-supported loci, backend identity, and supported program formats.
-
-QRMI currently reads IQM-native target data through `QuantumResource.target()`.
-The QFw QRMI driver converts that payload into the input shape expected by
-`qhw-iqm`, then returns normalized qhw device and coupling records.
-
-QDMI currently reads device information through MQT Core FoMaC. QDMI-on-IQM
-fetches IQM REST data internally, parses it, and populates FoMaC/QDMI device
-objects. QFw reads those objects and builds qhw device and coupling records
-with `qhw-data` builders.
-
-The unification path is for both implementations to satisfy the same
-device-introspection data schema. They do not need to expose the same internal
-source representation. The contract should define the normalized output and
-the required provenance fields.
+<summary><strong>QDMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Calibration And Quality Data</strong></summary>
+<summary><strong>Comparison Analysis</strong></summary>
 
-Calibration and quality data includes calibration set IDs, quality metric set
-IDs, T1 and T2 values, gate fidelity, readout fidelity, calibration validity,
-and measurement context.
+</details>
 
-QRMI target data appears to carry IQM dynamic architecture, calibration set,
-and quality metrics. The current QFw QRMI driver only wires the device and
-coupling normalization path. Calibration snapshot support is not yet fully
-bound in the shim.
+## Device Scheduler Control
 
-QDMI-on-IQM fetches IQM calibration quality metrics internally. It stores
-selected metrics on FoMaC/QDMI site and operation objects, including T1, T2,
-single-qubit fidelity, and two-qubit fidelity. QFw can access some of that
-through FoMaC extraction, but the current `get_calibration_snapshot` route is
-still marked as a later milestone.
-
-The unification path is a separate normalized calibration schema. Both
-interfaces should return calibration summaries and detailed observations in a
-common structure. Provider-specific details can live in extensions.
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Telemetry</strong></summary>
-
-Telemetry covers health, queue state, load, availability, timing, current
-calibration, status transitions, and operational counters. It serves both
-runtime policy and observability.
-
-The current QFw shim does not expose telemetry as a separate category. QRMI
-can eventually provide resource and job telemetry. QDMI exposes device status
-and static device properties, but QFw does not yet translate that into a
-telemetry API.
-
-The unification path is an `api_telemetry` category. It should provide compact
-state for schedulers and richer state for monitoring services. Data returned
-through this API should use normalized records where possible.
+<summary><strong>QDMI Behavior</strong></summary>
 
 </details>
 
 <details>
-<summary><strong>Device Authentication</strong></summary>
-
-Device authentication is the mechanism used to obtain access to the hardware
-provider. In the current QFw shim, both QRMI and QDMI use the same practical
-credential sources. They read `QFW_QC_URL` and `QFW_API_KEY`, or fall back to
-the shared QFw device-access configuration.
-
-QRMI converts those values into the endpoint and token environment expected by
-its IQM resource path. QDMI passes the URL and token to the FoMaC dynamic
-device loader, which initializes the QDMI-on-IQM session.
-
-The unification path is a separate device-authentication API category. A
-trusted resource-manager integration should inject job-scoped credentials into
-the QPM service. The service should store them in memory by job or lease ID
-and use them for device calls. This avoids exposing provider tokens as a
-normal application concern.
+<summary><strong>Comparison Analysis</strong></summary>
 
 </details>
+
+## Runtime Submission
+
+Runtime submission is the application-facing path for executing quantum work.
+This axis focuses on the public API used to submit a task, the payload form that
+API accepts, and the layer responsible for translating user programs into
+provider jobs.
 
 <details>
-<summary><strong>Control-Plane Authorization</strong></summary>
+<summary><strong>QRMI Behavior</strong></summary>
 
-Control-plane authorization governs who can change admission, scheduler, and
-authentication policy. It is different from device authentication. Device
-authentication proves access to the hardware provider. Control-plane
-authorization proves that the caller is allowed to change service policy.
+The QRMI public runtime API is the `QuantumResource` task lifecycle. For an IQM
+resource, the application creates a resource object, acquires it, builds an
+IQM-specific payload, submits the task, polls status, retrieves results, and
+releases the resource.
 
-The current QFw shim does not implement control-plane authorization. The
-development path still assumes direct test access to QPM calls.
+```python
+qrmi = QuantumResource(resource_id, ResourceType.IQMServer)
+lock = qrmi.acquire()
 
-The unification path is a protected control API. It should require a trusted
-identity from the site resource manager, a control daemon, or a comparable
-authorization system. Ordinary application clients should not be able to
-configure admission policy, scheduler policy, or device credentials.
+payload = Payload.IQMServer(
+    iqmjson=iqm_json,
+    job_type="circuit",
+    use_timeslot=False,
+    tag=None,
+)
 
-</details>
+job_id = qrmi.task_start(payload)
+status = qrmi.task_status(job_id)
+result = qrmi.task_result(job_id)
+logs = qrmi.task_logs(job_id)
 
-<details>
-<summary><strong>Data Normalization</strong></summary>
-
-Data normalization is a cross-cutting category. It applies to device records,
-coupling graphs, calibration data, telemetry, and execution results.
-
-QRMI currently gives QFw an IQM-native target payload. The QFw QRMI driver
-passes that payload to `qhw-iqm`, which produces qhw-data normalized records.
-
-QDMI currently gives QFw a FoMaC object model. QDMI-on-IQM has already parsed
-the IQM REST data internally. QFw extracts topology and operation information
-from FoMaC and builds qhw-data records directly. That means QDMI is already
-closer to returning an implementation-neutral view, but the current QFw path
-does not yet use a shared QDMI data-normalization implementation.
-
-The unification path is `api_data_normalization`. The spec should define the
-normalized records, the builder API, and the extractor API. Implementations can
-use `qhw-data`, `qhw-iqm`, or their own conforming implementation. QFw should
-consume the normalized records and preserve source/provenance fields.
-
-</details>
-
-<details>
-<summary><strong>Program Representation And Placement</strong></summary>
-
-Program representation covers the accepted input form for quantum work. It
-also covers execution options and logical-to-physical placement.
-
-QRMI is currently exercised through QFw with OpenQASM in the smoke test. The
-longer-term execution path needs to define how Qiskit, QIR, IQM JSON, and
-placement hints are represented at the QPM contract boundary.
-
-QDMI-on-IQM internally supports IQM JSON and QIR-style program formats. It can
-include IQM job options such as calibration set ID, shot count, heralding,
-move validation mode, dynamical decoupling mode, and qubit mapping.
-
-The unification path is a submission envelope that carries payload format,
-payload reference or inline payload, execution options, and placement hints.
-The lower implementation can translate that envelope into its native job
-format.
-
-</details>
-
-<details>
-<summary><strong>Error Model</strong></summary>
-
-Errors currently flow through QFw/DEFw exceptions and shim result dictionaries.
-This is useful for development but weak as a cross-interface contract.
-
-QRMI errors appear as Python exceptions in the QFw driver path. QDMI errors can
-originate as QDMI return codes, FoMaC exceptions, or Python exceptions after
-binding. The current QFw shim does not normalize those categories.
-
-The unification path is a common error record. It should include category,
-code, message, provider code, retryability, call name, device ID, job ID when
-available, and raw provider details when safe to return.
-
-</details>
-
-<details>
-<summary><strong>Extensibility And Versioning</strong></summary>
-
-The current QFw shim expresses capability with a static descriptor. That is
-enough to compare QRMI and QDMI today, but it does not define API versioning or
-feature negotiation.
-
-The unification path is category-level versioning. A service should be able to
-advertise support for `api_runtime`, `api_data_normalization`,
-`api_telemetry`, `api_admission`, and related categories independently. Each
-category should define required fields, optional fields, extension points, and
-version compatibility rules.
-
-</details>
-
-## QFw Comparison Test Plan
-
-The QFw test path is the practical mechanism for filling this document with
-evidence. The current test service is `svc_lib_qpm`. It is started by
-`examples/qfw_shim_smoke.sh` with
-`examples/qfw_shim_smoke_services.yaml`. The test client is
-`examples/tests/test_shim_smoke.py`.
-
-The most useful current command shape is:
-
-```bash
-cd /workspace/qfw-container-base/QFw/examples
-./qfw_shim_smoke.sh --libs qdmi,qrmi --call get_device_info
+qrmi.task_stop(job_id)
+qrmi.release(lock)
 ```
 
-The `--libs qdmi,qrmi` form runs supported introspection calls once through
-each requested lower library. This gives side-by-side output for axes where
-both libraries are wired.
+For the IQM resource type, `Payload.IQMServer` carries an IQM JSON string. The
+low-level runtime API therefore exposes a provider-specific payload shape at
+the submission boundary. QRMI also has a Qiskit adapter. That adapter converts
+Qiskit circuits into IQM run-request JSON and then calls the same QRMI runtime
+path with `Payload.IQMServer`. The adapter improves usability for Qiskit users,
+but it is layered above the public QRMI resource API.
 
-### Current One-Call Tests
+</details>
 
-| Axis | QFw test command | Useful evidence |
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+QDMI separates the public client API from the provider-side device
+implementation. The public runtime surface is the client job interface in
+`HAL/QDMI/include/qdmi/client.h`. A client initializes a session, discovers
+available devices, creates a `QDMI_Job`, sets job parameters, submits the job,
+waits or polls for completion, and retrieves typed results.
+
+```c
+QDMI_device_create_job(device, &job);
+QDMI_job_set_parameter(job, QDMI_JOB_PARAMETER_PROGRAMFORMAT,
+                       sizeof(format), &format);
+QDMI_job_set_parameter(job, QDMI_JOB_PARAMETER_PROGRAM,
+                       program_size, program);
+QDMI_job_set_parameter(job, QDMI_JOB_PARAMETER_SHOTSNUM,
+                       sizeof(shots), &shots);
+
+QDMI_job_submit(job);
+QDMI_job_check(job, &status);
+QDMI_job_wait(job, timeout);
+QDMI_job_get_results(job, QDMI_JOB_RESULT_HIST_KEYS,
+                     key_size, keys, &key_size_ret);
+QDMI_job_get_results(job, QDMI_JOB_RESULT_HIST_VALUES,
+                     value_size, values, &value_size_ret);
+QDMI_job_free(job);
+```
+
+The job payload is described by typed parameters. The common parameters are
+program format, program data, and shot count. The result path is also typed.
+Common selectors include `QDMI_JOB_RESULT_SHOTS`,
+`QDMI_JOB_RESULT_HIST_KEYS`, and `QDMI_JOB_RESULT_HIST_VALUES`.
+
+The `IQM_QDMI_device_*` functions belong to the provider-side device
+implementation. They mirror the client job operations, but they are the hooks
+implemented by the IQM device library rather than the portable client-facing
+API. In QDMI-on-IQM, `IQM_QDMI_device_job_submit()` accepts IQM JSON, QIR base
+strings, and calibration programs. The implementation builds the IQM REST job
+document internally. It adds the calibration set ID, shot count, execution
+options, and optional qubit mapping before sending the job to IQM.
+
+QDMI-on-IQM also exposes a Qiskit path through MQT Core. The Qiskit backend
+loads the IQM QDMI device library and presents Qiskit-compatible execution.
+That path is an adapter above QDMI, similar in role to the QRMI Qiskit adapter.
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+QRMI and QDMI both expose a task or job lifecycle, but they place the portable
+boundary in different places.
+
+QRMI presents a generic resource lifecycle. The submitted payload is typed by
+resource. For IQM, that resource payload is IQM JSON. A portable application
+therefore needs an adapter if it starts from Qiskit, QIR, OpenQASM, or another
+higher-level representation.
+
+QDMI presents a structured job lifecycle with standard job parameters and
+standard result selectors. The payload still depends on the selected program
+format. An application that submits `QDMI_PROGRAM_FORMAT_IQMJSON` remains tied
+to IQM's circuit representation. An application that submits
+`QDMI_PROGRAM_FORMAT_QIRBASESTRING` is using a more portable program
+representation, assuming the target implementation supports that format.
+
+The main design difference is the submission envelope. QRMI's low-level
+runtime call is resource-oriented and provider-payload-oriented. QDMI's public
+client API is job-oriented and declares the program format separately from the
+program bytes. QDMI therefore has a clearer place to negotiate supported
+formats, but provider-specific options currently flow through custom
+parameters. That custom-parameter path will need stronger standardization if
+the same API is expected to support placement, calibration selection, and
+provider execution controls portably.
+
+From the application developer perspective, both paths still leak backend
+selection into the application. A direct QRMI application must choose the
+resource-specific payload shape, such as `Payload.IQMServer`, and provide the
+format expected by that backend. A direct QDMI application uses a common job
+API, but it must still select the correct `QDMI_PROGRAM_FORMAT_*` enum for the
+target implementation. In practice, this pushes each application toward its own
+adapter layer or switch statement.
+
+The openQSE direction should separate the runtime envelope from the program
+payload. The qtask envelope is the runtime object. It is similar in role to a
+QDMI job because it carries task metadata, execution options, placement hints,
+resource requirements, result routing, provenance, and the program payload. The
+payload is the compiled quantum program. Its format should be an agreed
+exchange format rather than a provider choice made independently by every
+application.
+
+In the common stack, applications should not need to call QRMI or QDMI directly.
+They submit source-level code or framework circuits to the software stack. The
+compiler and tool pipeline can use any internal IRs it needs while lowering the
+program. Those internal IRs are separate from the runtime exchange format unless
+one is explicitly selected as the exchange format.
+
+```text
+application source / framework circuit
+  -> compiler/tool pipeline
+  -> provider-neutral exchange payload
+  -> openQSE qtask envelope
+  -> QRMI/QDMI/runtime layer
+  -> backend accepts exchange payload or rejects unsupported format
+```
+
+Direct QRMI or QDMI use should still be possible. In that mode, the caller
+bypasses the higher openQSE stack but still submits one of the supported payload
+classes. A portable caller uses the agreed openQSE exchange format. A caller
+that intentionally needs provider-specific behavior uses a provider-native
+payload and gives up portability for that call.
+
+```text
+direct application
+  -> QRMI/QDMI/runtime layer
+  -> payload is one of:
+       openqse.exchange.v1
+       provider.native
+```
+
+Precompiled and JIT-capable workflows can fit inside the same exchange model.
+The exchange payload can carry metadata describing its compilation stage,
+target constraints, and whether JIT or final lowering is allowed. This avoids
+creating a separate precompiled format before there is evidence that one is
+needed.
+
+```text
+precompiled portable payload / intermediate IR
+  -> runtime selects target
+  -> backend or runtime JITs/lowers to hardware-native program
+  -> execution
+```
+
+The exchange model should not start by selecting one preferred circuit format.
+The first step is to agree on the criteria used to select the portable exchange
+format or formats. Candidate formats include QIR, OpenQASM, and other
+well-defined IRs. Each candidate needs to be evaluated against the same
+requirements. The format must be expressive enough for expected workloads,
+including measurement, classical conditions, placement information, and
+provider-neutral execution options. It must also scale as circuits grow. Large
+workloads should not require transferring gigabytes of repeated text when a
+compact representation, binary encoding, compression, or payload reference
+would be more appropriate. The format should be easy to validate, version, and
+extend. It should also allow provider-native extensions without forcing those
+extensions into portable application code.
+
+This split creates a direct dependency between the openQSE working groups. The
+Resource Interface and Management working group defines how work is submitted
+and routed to resources. The Compiler Infrastructure working group defines how
+programs are lowered into portable exchange payloads.
+
+| Working group | Owns | Needs from the other group |
 |---|---|---|
-| Service discovery and descriptor routing | `./qfw_shim_smoke.sh --libs qdmi,qrmi --call test` | Confirms the shim QPM service starts, registers, and is selected by device ID and provider properties. |
-| Capability advertisement | `./qfw_shim_smoke.sh --libs qdmi,qrmi --call get_device_info` | The test prints `capability_map` before fan-out. This shows which calls QFw believes QRMI and QDMI can serve. |
-| Device introspection | `./qfw_shim_smoke.sh --libs qdmi,qrmi --call get_device_info` | Compare qhw-device records, provider/device IDs, qubit counts, qubit labels, metadata source, and raw/provenance fields. |
-| Coupling graph | `./qfw_shim_smoke.sh --libs qdmi,qrmi --call get_coupling_graph` | Compare qhw-coupling records, edges, directionality, supported operations, and loci. |
-| Calibration and quality data | `./qfw_shim_smoke.sh --lib qdmi --call get_calibration_snapshot` | Current expected result is a gap or pending binding. This identifies what QDMI can fetch internally but QFw does not yet expose. |
-| Backend information | `./qfw_shim_smoke.sh --libs qdmi,qrmi --call get_backend_info` | Current expected result may be pending for both paths. Useful to define what backend metadata should contain. |
-| Runtime submission | `./qfw_shim_smoke.sh --lib qrmi --call async_run` | Exercises execution through the current execution owner and validates callback completion behavior. |
-| Job metadata | `./qfw_shim_smoke.sh --lib qrmi --call get_last_job_metadata` | Should be run after an execution test or through the default sequence. Captures job metadata behavior after submission. |
-| Error model | Run an unsupported combination, such as `./qfw_shim_smoke.sh --lib qdmi --call async_run` | Captures how unsupported calls and lower-library failures are reported today. |
+| Resource Interface and Management | qtask envelope, runtime submission contract, payload-class negotiation, accepted/rejected format behavior, provider-native escape hatch, result and error expectations. | Exchange format definition, payload stages, validation rules, feature requirements, and compiler-visible constraints. |
+| Compiler Infrastructure | Compiler/tool pipeline, internal IR choices, lowering strategy, portable exchange payload definition, JIT/lowering metadata, and exchange-format versioning. | qtask envelope schema, resource capability model, placement fields, execution-option fields, supported payload classes, and runtime error semantics. |
 
-### Default Smoke Sequence
+</details>
 
-Run the default sequence for the current execution owner:
+## Job Lifecycle And Results
 
-```bash
-cd /workspace/qfw-container-base/QFw/examples
-./qfw_shim_smoke.sh --lib qrmi
-```
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
-Run a side-by-side introspection comparison:
+</details>
 
-```bash
-cd /workspace/qfw-container-base/QFw/examples
-./qfw_shim_smoke.sh --libs qdmi,qrmi
-```
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
 
-The default sequence currently covers service startup, capability-map
-inspection when `--libs` is used, selected introspection calls, asynchronous
-execution, callback completion, and post-execution metadata.
+</details>
 
-### Evidence To Capture Per Run
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
 
-For each axis, the test output should be saved with enough context to support
-later comparison. The minimum useful record is:
+</details>
 
-- QFw branch and commit.
-- QRMI and QDMI-on-IQM versions or commits.
-- QFw service descriptor used for the run.
-- Device ID and provider.
-- Command line.
-- Full returned payload.
-- Whether the payload is raw provider data, FoMaC-extracted data, or qhw-data.
-- Error category and traceback when the call fails.
+## Device Introspection
 
-### Gaps In The Current Test Harness
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
 
-The current tests are sufficient for device and coupling comparison. They are
-not yet sufficient for the full interface comparison.
+</details>
 
-Missing test coverage:
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
 
-- Admission and admission-control APIs.
-- Scheduler-control APIs.
-- Telemetry APIs.
-- Control-plane authorization.
-- QDMI execution through QFw.
-- Calibration snapshot normalization through both QRMI and QDMI.
-- Result normalization parity between QRMI, QDMI, and native IQM paths.
+</details>
 
-These gaps should be addressed by adding API categories to `api_qpm` or by
-splitting them into smaller service APIs as the QFw design evolves.
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Calibration And Quality Data
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Telemetry
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Device Authentication
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Control-Plane Authorization
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Data Normalization
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Program Representation And Placement
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Error Model
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
+
+## Extensibility And Versioning
+
+<details>
+<summary><strong>QRMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>QDMI Behavior</strong></summary>
+
+</details>
+
+<details>
+<summary><strong>Comparison Analysis</strong></summary>
+
+</details>
