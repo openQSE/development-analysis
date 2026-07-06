@@ -341,18 +341,68 @@ programs are lowered into portable exchange payloads.
 
 ## Device Introspection
 
+Device introspection is the information used for placement, validation,
+compilation, scheduling, and reporting: device identity, qubits, operations,
+topology, supported loci, and backend properties. This axis focuses on the shape
+in which each interface exposes that information.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI exposes introspection through `QuantumResource.target()` (and
+`metadata()`). For an IQM resource, `target()` returns a single JSON document
+assembled from three IQM Server REST calls: the dynamic quantum architecture
+(qubits, gates, and their loci), the calibration set, and the quality metric
+set. The document is raw IQM data — the field names and structure are
+provider-specific, and the consumer parses the IQM shapes directly.
+
+`target()` is not reservation-bound; it does not require `acquire()` and reads
+the current data with only a valid endpoint and token. There is no separate
+typed topology or property API distinct from this document; discovery and
+introspection are the parsing of the raw payload.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI exposes introspection as a typed, vendor-neutral query interface. Through
+MQT Core's FoMaC (`mqt.core.fomac`), a `Device` provides typed accessors:
+`name()`, `version()`, `status()`, `qubits_num()`, `supported_program_formats()`,
+`needs_calibration()`, `duration_unit()`, `coupling_map()`, `sites()`, and
+`operations()`. A `Site` exposes `name()` (the device's real qubit label, e.g.
+`"QB1"`), `index()`, `t1()`, `t2()`, and coordinates. An `Operation` exposes
+`name()`, its loci through `sites()` / `site_pairs()`, `fidelity()`,
+`duration()`, and `idling_fidelity()`.
+
+The values are the device's real labels and metrics, not a provider-specific
+document. Every query is session-based: the session must be initialized before
+any property can be read.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+QRMI presents introspection as one raw provider document behind a single call;
+QDMI presents it as a set of typed, vendor-neutral properties. The QRMI form
+preserves everything the provider sends — including calibration and quality
+identity — at the cost of provider-specific parsing. The QDMI form is portable
+and directly consumable, but exposes what its neutral property set covers: the
+per-qubit and per-gate metric values are present, while the provider's
+calibration-set identity is not currently reachable through the FoMaC Python
+accessors.
+
+A concrete consequence in QFw: `get_device_info` and `get_coupling_graph` are
+served by both interfaces, but `get_backend_info` and `get_dynamic_backend_info`
+are served only by QRMI, because their shape carries raw IQM architecture data
+(static architecture, active qubits, calibration-set id) that the QDMI-neutral
+property model does not expose in that form.
+
+For a common spec: a typed, neutral property model (QDMI-like) is the more
+portable basis, provided it also reserves a defined place for provider identity
+and provenance (such as the calibration-set id) that the raw model (QRMI)
+already carries.
 
 </details>
 
@@ -535,18 +585,62 @@ raw calibration and quality-metric observation sets.
 
 ## Device Authentication
 
+Device authentication is how each interface obtains and applies the credentials
+used to reach the quantum hardware provider. This axis focuses on how the
+credential is injected and when it is required.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+For an IQM resource, QRMI reads credentials from environment variables at
+resource construction: `{backend}_QRMI_IQM_ISA_ENDPOINT` for the server URL and
+`{backend}_QRMI_IQM_ISA_TOKEN` for the bearer token, with an optional
+`{backend}_QRMI_JOB_ACQUISITION_TOKEN`. The names are keyed by the backend
+portion of the resource id. In a SLURM deployment the SPANK plugin injects these
+into the job environment during the prologue. The token is applied as an HTTP
+bearer token on the IQM Server API calls.
+
+Credentials are read once, at construction, from the process environment. The
+introspection path (`target()`) is not session-bound, so it needs only a valid
+endpoint and token.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI passes connection settings as device-session parameters rather than
+environment variables. In FoMaC these are arguments to the session/device
+loader: `base_url`, `token` (or `auth_file`), and `custom1..5`. The IQM
+implementation holds a token manager and applies the bearer token to its HTTP
+calls.
+
+Authentication is bound to the session. The session must be initialized before
+any query, and initialization fails without a base URL and token — after which
+every subsequent query returns `QDMI_ERROR_BADSTATE`.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+Both interfaces ultimately authenticate with an IQM bearer token over HTTPS. The
+difference is injection and binding. QRMI takes credentials from named
+environment variables, which aligns with a scheduler-injected model
+(SPANK-populated job environment). QDMI takes them as explicit session
+parameters, which aligns with an in-process client model. QRMI's introspection
+is not session-bound and needs only the token; QDMI's is session-bound, so
+credentials plus a successful session initialization are prerequisites to any
+call.
+
+In QFw both are fed from the same device-access resolution, so the same URL and
+token reach both interfaces — delivered as environment variables for QRMI and as
+function parameters for QDMI.
+
+For a common spec: credential acquisition should be separable from the
+execution and introspection APIs (both interfaces already do this), with a
+defined injection contract that supports both environment-based
+(scheduler-injected) and parameter-based (in-process) delivery.
 
 </details>
 
@@ -569,18 +663,52 @@ raw calibration and quality-metric observation sets.
 
 ## Data Normalization
 
+Data normalization is the conversion from provider-native or interface-native
+payloads into common records that downstream software can consume without
+provider-specific parsing. This axis focuses on what each interface returns and
+what a consumer must still do to reach a common record.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI returns provider-native payloads. `target()` is raw IQM JSON, and
+`task_result()` is raw IQM measurement JSON. Conversion to any common record is
+the consumer's responsibility. QRMI ships a Qiskit adapter that converts these
+into Qiskit objects, but that adapter is a separate layer above the core
+`QuantumResource` API, not part of the resource interface itself.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI returns interface-native typed values through its property and result
+model, surfaced by FoMaC as typed Python objects. These values are already
+vendor-neutral, but they are QDMI's shape (sites, operations, typed job
+results), not a downstream common record. A consumer that targets its own record
+schema still adapts from the QDMI shape.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+Neither interface emits the consumer's final record; both require an adapter.
+They differ in the level they start from. QRMI hands back raw provider data
+(thick), which needs a provider-specific adapter. QDMI hands back neutral typed
+data (thin), which needs a shape adapter.
+
+In QFw this is implemented as "one schema, two adapters": the QRMI raw IQM data
+is normalized by `qhw-iqm`, and the QDMI FoMaC data is normalized by
+`fomac_normalize`, and both converge on the same `qhw-*-v1` records. The two
+adapters can populate different fields of the same record — for calibration, the
+QRMI adapter fills the IQM observation-set identity (set ids, counts,
+timestamps) while the QDMI adapter fills measured T1/T2 and gate fidelity.
+
+For a common spec: the normalized record schema is the contract, and the
+normalizer is a per-source adapter. A single schema with clearly optional,
+provider-specific fields lets a thick source and a thin source converge on one
+record without forcing either to invent data it does not have.
 
 </details>
 
@@ -603,18 +731,80 @@ raw calibration and quality-metric observation sets.
 
 ## Error Model
 
+The error model is how each interface represents failures, provider errors, and
+retryability at the call boundary. It determines whether a caller can detect and
+diagnose a failure, or whether a failure is silently absorbed into the returned
+data.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI's `QuantumResource` methods propagate most failures as exceptions: the
+Python binding converts an internal `anyhow` error into a `PyRuntimeError`. The
+device-introspection path is an exception to this rule. For an IQM resource,
+`target()` assembles its result from three IQM Server REST calls
+(`dynamic-quantum-architecture`, the calibration set, and quality metrics), and
+each call is individually guarded so that a failure is logged and the field is
+replaced with `null`:
+
+```rust
+resp["dynamic_quantum_architecture"] = match get_dynamic_quantum_architecture_v1(...).await {
+    Ok(bytes) => parse(bytes),
+    Err(e)   => { error!("Failed to get dynamic_quantum_architecture: {:?}", e); json!(null) }
+};
+```
+
+`target()` therefore returns `Ok` with null fields on partial or total failure;
+the HTTP status is never propagated to the caller.
+
+Diagnostics depend on the `log` crate (`log::error!`). In QRMI, `env_logger` is
+initialized only in the standalone example and CLI binaries, not in the Python
+extension, and there is no `pyo3-log` bridge. When QRMI is used as a Python
+library, no logging backend is registered, so those `error!` records are
+dropped and `RUST_LOG` has no effect. A failed device fetch then surfaces as
+empty data with no exception and no log line.
+
+(Verified against QRMI tag `0.17.2`, the version pinned in the QFw container.)
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI returns a typed integer status code from every call
+(`QDMI_SUCCESS`, `QDMI_ERROR_INVALIDARGUMENT`, `QDMI_ERROR_BADSTATE`,
+`QDMI_ERROR_NOTSUPPORTED`, `QDMI_ERROR_FATAL`, `QDMI_ERROR_TIMEOUT`, ...). The
+device implementation maps its internal and provider failures onto these codes.
+For example, the IQM implementation returns `QDMI_ERROR_BADSTATE` when a device
+property is queried before the session is initialized, and
+`QDMI_ERROR_INVALIDARGUMENT` for a malformed request.
+
+The status code is returned at the point of the failing call, and MQT Core's
+FoMaC layer surfaces a non-success code to the Python caller as a raised error
+rather than as substituted data.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+The two interfaces sit at opposite ends of error visibility. QDMI reports
+failures as typed codes at the call that failed. QRMI reports execution failures
+as exceptions but, on the introspection path, degrades to `null` data instead of
+raising; combined with the absence of a logger in its Python build, the
+underlying cause is invisible to the caller.
+
+This was observed directly in QFw testing. A configured base URL with a trailing
+slash caused QRMI's IQM client to build `//api/v1/...`; all three `target()`
+fetches returned 404; and the shim received a fully-null target with no
+exception and no log. The same class of failure on the QDMI path would surface
+as a non-success status at the query.
+
+For a common spec: an introspection/target call needs a defined
+error-propagation contract (a typed error or a raised exception), and provider
+adapters should not silently substitute empty data for a failed fetch. A related
+requirement is observability — a logging facility that is active when the
+interface is embedded as a library, not only in its standalone binaries.
 
 </details>
 
