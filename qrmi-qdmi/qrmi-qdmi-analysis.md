@@ -163,6 +163,14 @@ Qiskit circuits into IQM run-request JSON and then calls the same QRMI runtime
 path with `Payload.IQMServer`. The adapter improves usability for Qiskit users,
 but it is layered above the public QRMI resource API.
 
+For the IQM resource, `Payload.IQMServer.iqmjson` is the entire run request, not
+a single circuit. It carries the `circuits` array, the shot count, and the
+calibration set id, and is POSTed as the job body. In the QFw shim the QRMI
+driver builds it as an iqm-client `RunRequest` and serializes it with
+`model_dump_json()` -- the same object the QRMI Qiskit adapter produces. The
+execution parameters (shots, calibration set) live inside this opaque provider
+blob.
+
 </details>
 
 <details>
@@ -210,6 +218,15 @@ QDMI-on-IQM also exposes a Qiskit path through MQT Core. The Qiskit backend
 loads the IQM QDMI device library and presents Qiskit-compatible execution.
 That path is an adapter above QDMI, similar in role to the QRMI Qiskit adapter.
 
+For `QDMI_PROGRAM_FORMAT_IQMJSON`, the `PROGRAM` parameter is a single circuit,
+not a run request. `IQM_QDMI_device_job_submit_circuit()` wraps it -- it builds
+`{"circuits": [program], "calibration_set_id": <session>, "shots": <SHOTSNUM>,
+...}` and POSTs that. The shot count arrives as the typed
+`QDMI_JOB_PARAMETER_SHOTSNUM` parameter, separate from the program bytes, and
+the calibration set id comes from the initialized session. In the QFw shim the
+QDMI driver serializes just the transcoded circuit and passes shots to
+`submit_job(...)`; the run-request envelope is assembled by the device library.
+
 </details>
 
 <details>
@@ -246,6 +263,23 @@ format expected by that backend. A direct QDMI application uses a common job
 API, but it must still select the correct `QDMI_PROGRAM_FORMAT_*` enum for the
 target implementation. In practice, this pushes each application toward its own
 adapter layer or switch statement.
+
+The two interfaces put the same provider format at different payload
+granularities, which the QFw shim had to handle explicitly. QRMI's `iqmjson` is
+the whole run request: the caller owns circuit-batching, shots, and
+calibration-set selection, all packed into one opaque provider blob. QDMI's
+`IQM_JSON` program is a single circuit, and the surrounding request -- circuits
+array, shots, calibration set, execution options -- is assembled by the device
+implementation, with shots supplied as a typed job parameter. So "the backend
+takes IQM JSON" is not one thing across the two interfaces; it denotes a
+run-request document in one and a bare circuit in the other.
+
+This granularity difference is a small but direct argument for the qtask
+envelope and payload split below. QDMI already separates the execution
+parameters (shots as a typed parameter, format declared explicitly) from the
+program bytes, which is closer to an envelope-plus-payload model. QRMI folds
+those parameters into the provider payload, so a portable caller cannot set
+shots or select a calibration set without editing an opaque provider document.
 
 The openQSE direction should separate the runtime envelope from the program
 payload. The qtask envelope is the runtime object. It is similar in role to a
