@@ -11,6 +11,13 @@ consumers. Applications, resource managers, schedulers, operators, monitoring
 services, and authentication services do not need the same calls. The axes below
 split the interface by function so each category can be evaluated on its own.
 
+**Status (2026-07-28):** the comparison now has live-hardware backing. Both
+interfaces ran against the ORNL IQM 20-qubit system through the QFw shim:
+device introspection through each returned the same normalized topology (20
+qubits, 30 edges, in agreement), and one canonical circuit executed through
+each returned identical counts in the same normalized result record. Axis
+entries below that cite hardware observations derive from those runs.
+
 ## Comparison Axes
 
 This table defines the comparison axes. It describes what each axis means and
@@ -281,6 +288,28 @@ program bytes, which is closer to an envelope-plus-payload model. QRMI folds
 those parameters into the provider payload, so a portable caller cannot set
 shots or select a calibration set without editing an opaque provider document.
 
+Running both submission paths against live hardware surfaced two further
+consequences of this ownership split.
+
+Serialization responsibility follows the envelope. Both QFw drivers consume the
+same transcoded circuit object (an `iqm.pulse` `Circuit`, a Python dataclass).
+The QRMI leg passes it into the iqm-client `RunRequest` model, whose pydantic
+validation coerces the dataclass implicitly — the caller never explicitly
+serializes. The QDMI leg submits the bare circuit and must therefore produce
+the JSON itself; iqm-client's `to_json_dict()` helper is typed for plain dicts
+and rejects the dataclass. The "same" provider circuit thus has two different
+serialization owners, and a transcode layer shared across both interfaces has
+to know which consumer it feeds.
+
+Caller-owned assembly also couples every caller to the provider SDK's payload
+surface and its stability. The QFw QRMI driver originally built the run request
+with an iqm-client helper that turned out to be private (`_build_run_request`);
+iqm-client 34.0.1 removed it, and submission broke with an import error before
+any request was sent, while the public `RunRequest` model remained stable
+throughout. On the QDMI path the equivalent assembly lives once, inside the
+device implementation, so provider-SDK coupling is contained there instead of
+distributed across callers. (Both breakages and their fixes: openQSE/QFw #31.)
+
 The openQSE direction should separate the runtime envelope from the program
 payload. The qtask envelope is the runtime object. It is similar in role to a
 QDMI job because it carries task metadata, execution options, placement hints,
@@ -358,18 +387,96 @@ programs are lowered into portable exchange payloads.
 
 ## Job Lifecycle And Results
 
+Job lifecycle is the path from a submitted task to its results: status
+tracking, waiting, cancellation, result retrieval, and the identity that ties a
+result back to the provider-side job. The entries below record behavior
+observed when both interfaces executed the same circuit on live hardware (the
+ORNL IQM 20-qubit system) through the QFw shim.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+The lifecycle is the task half of `QuantumResource`: `task_start` returns the
+task identifier, `task_status` is polled until terminal, `task_result` returns
+the result payload, `task_logs` returns provider logs, and `task_stop` cancels.
+There is no wait call; pacing is the caller's polling loop.
+
+For an IQM resource, the identifier returned by `task_start` is the IQM
+server's job UUID itself, and `task_result` is raw IQM measurement JSON. The
+provider-side job identity is therefore native to the lifecycle: the caller can
+correlate its task with the IQM job record afterward without any extra call.
+
+Because the caller also assembled the run request (see Runtime Submission),
+everything about the submission is available for provenance. The QFw shim's
+normalized result record from the QRMI leg carries the job UUID, the provider
+status string, the calibration set id, and the full run request that produced
+the counts under `extensions["iqm.v1"]`.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+The lifecycle is the client job API: `QDMI_job_submit`, `QDMI_job_check`,
+`QDMI_job_wait(timeout)`, `QDMI_job_cancel`, `QDMI_job_get_results` with typed
+result selectors, `QDMI_job_query_property`, and `QDMI_job_free`. Compared with
+QRMI it adds a blocking wait and an explicit free, and results are typed
+selections (shot count, histogram keys, histogram values) rather than one raw
+payload.
+
+Through MQT Core's FoMaC Python surface the QFw shim drives this as
+`submit_job(...)` returning a `Job`, then `Job.check()` until terminal, then
+`Job.get_counts()`. The counts arrive typed and correct.
+
+What does not arrive is identity. No accessor on the FoMaC job object returns
+the provider-side job id, and none returns the calibration set the job ran
+under — the same accessor-gap family already noted for calibration identity
+under Device Introspection. The run-request envelope was assembled inside the
+device implementation (see Runtime Submission), so the caller never held the
+submission document either. The shim's normalized record from the QDMI leg
+reduces to status plus counts: `job: {status: completed}`, empty `extensions`.
+
+`QDMI_job_query_property` is the natural place for such identity to surface if
+a standard job-identity property were defined; the gap observed here is that no
+such property is reachable through the current FoMaC path.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+On lifecycle mechanics the two interfaces are equivalent for the simple case,
+and the hardware run demonstrates it: the same canonical circuit submitted
+through each returned identical counts in the same normalized record
+(`qhw-result-v1`). The observed field-level difference is entirely in identity
+and provenance:
+
+| Normalized-record field | QRMI leg | QDMI leg |
+|---|---|---|
+| `result.counts` | `{'1': 10}` | `{'1': 10}` |
+| `job.id` | IQM job UUID | absent |
+| `job.provider_status` | `completed` | absent |
+| `calibration.id` | present | absent |
+| `extensions` | `iqm.v1`: run request + measurement sets | `{}` |
+
+The asymmetry is a direct consequence of where the run request is assembled.
+The layer that builds the envelope is the layer that holds the job identity,
+the calibration selection, and the execution options. QRMI leaves assembly with
+the caller, so the caller has all of it. QDMI-on-IQM assembles inside the
+device library, and nothing hands identity or provenance back up.
+
+The practical consequence is traceability: a QDMI-path run currently cannot be
+correlated with the provider-side job after the fact. For scheduler accounting,
+usage reconciliation, or incident forensics on a shared instrument, that is a
+real hole — the site knows a job ran, but not which provider job it was, or
+against which calibration.
+
+For a common spec: the job lifecycle needs a standard provider-job-identity
+property on the job object (QRMI already returns it as the task id; QDMI's
+`QDMI_job_query_property` is the natural hook), and a defined provenance
+record — what was actually submitted, with which calibration selection and
+options — retrievable from the job regardless of which layer assembled the
+envelope.
 
 </details>
 
@@ -389,6 +496,12 @@ assembled from three IQM Server REST calls: the dynamic quantum architecture
 (qubits, gates, and their loci), the calibration set, and the quality metric
 set. The document is raw IQM data — the field names and structure are
 provider-specific, and the consumer parses the IQM shapes directly.
+
+On a live IQM server (the ORNL q20), the assembled document contained exactly
+those three components and no static architecture: the qubit set `target()`
+reports is the dynamic — currently calibrated — one. A consumer that needs the
+chip's static topology independent of the active calibration set (a separate
+endpoint in the native IQM API) does not get it through this call.
 
 `target()` is not reservation-bound; it does not require `acquire()` and reads
 the current data with only a valid endpoint and token. There is no separate
@@ -748,18 +861,72 @@ record without forcing either to invent data it does not have.
 
 ## Program Representation And Placement
 
+This axis covers the program formats each interface accepts, where execution
+options live, and whether logical-to-physical placement survives to the
+provider in an interpretable form. The observations below come from the same
+live-hardware execution runs as the Job Lifecycle axis; the canonical program
+was OpenQASM (`x q[0]; measure q[0] -> c[0]`), transcoded once and submitted
+through both interfaces.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+The accepted representation is typed by resource, and for IQM it is the
+provider's: IQM circuit JSON inside the caller-built run request. There is no
+format declaration or negotiation — the resource type implies the format.
+
+Placement is embedded in the program: IQM instructions name physical qubits
+directly (`"locus": ["QB1"]`). The run request has a `qubit_mapping` field for
+logical-name mapping, but it is unused when the circuit already carries
+physical names. In the QFw shim, OpenQASM is parsed with Qiskit and serialized
+to IQM instructions by `iqm.qiskit_iqm.serialize_instructions`, and the shim
+records the logical-to-physical assignment in circuit metadata. The run request
+observed on hardware carried `qubit_mapping: null`, physical loci in every
+instruction, and `"logical_to_physical": {"0": "QB1"}` as metadata — placement
+intent survives, but as embedded physical names plus an informational echo, not
+as a field the provider interprets.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI declares the program format as a typed job parameter
+(`QDMI_JOB_PARAMETER_PROGRAMFORMAT`) separate from the program bytes, and the
+formats are enumerated. QDMI-on-IQM accepts the provider-native single-circuit
+`IQMJSON`, QIR base strings, and calibration programs — so a portable candidate
+(QIR) is advertised beside the native form, and the interface has a defined
+place to reject an unsupported format at submission.
+
+For the `IQMJSON` format, placement is the same embedded physical naming as on
+the QRMI path — the transcoded circuit is identical. An optional qubit mapping
+can be attached by the device implementation when it assembles the run-request
+envelope, but the caller does not express placement through a portable QDMI
+field.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+For IQM, both interfaces ultimately submit the provider circuit form with
+physical qubit names, and the hardware run confirms placement survives that way
+through both — the same `prx` on `QB1` executed identically. Neither interface
+carries placement as a first-class, portable field: QRMI has an unused provider
+mapping slot plus a metadata echo, QDMI-on-IQM an implementation-internal
+option. Placement is a side effect of serialization in both.
+
+The format story differs. QDMI's explicit, enumerated format declaration gives
+it a negotiation point QRMI lacks: QRMI's payload is typed by resource, so
+format portability is invisible to the interface itself. This mirrors the
+Runtime Submission conclusion — QDMI is structurally closer to an
+envelope-plus-payload model.
+
+For a common spec: program format should be a declared, negotiable property of
+the submission, and placement should be a first-class envelope field with
+defined semantics. Embedded physical names work, but a runtime cannot validate,
+retarget, or even reliably read placement that exists only inside the
+serialized program.
 
 </details>
 
@@ -833,6 +1000,16 @@ slash caused QRMI's IQM client to build `//api/v1/...`; all three `target()`
 fetches returned 404; and the shim received a fully-null target with no
 exception and no log. The same class of failure on the QDMI path would surface
 as a non-success status at the query.
+
+A second instance, from the live-hardware runs, extends the consequence into
+execution. With the IQM endpoint unreachable (a dropped SSH tunnel in the
+remote-access setup), all three fetches failed at the TCP level and `target()`
+again returned successfully with all three fields null. The QRMI execution path
+consumes the same cached `target()` document to build its run request, so the
+connectivity failure surfaced two layers up, at circuit transcoding, as "IQM
+dynamic architecture did not report active qubits" — an availability fault
+presenting as a device-data fault. The null-substitution therefore does not
+only degrade introspection data; it feeds misleading state into submission.
 
 For a common spec: an introspection/target call needs a defined
 error-propagation contract (a typed error or a raised exception), and provider
