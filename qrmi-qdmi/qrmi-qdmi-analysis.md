@@ -428,17 +428,40 @@ Through MQT Core's FoMaC Python surface the QFw shim drives this as
 `submit_job(...)` returning a `Job`, then `Job.check()` until terminal, then
 `Job.get_counts()`. The counts arrive typed and correct.
 
-What does not arrive is identity. No accessor on the FoMaC job object returns
-the provider-side job id, and none returns the calibration set the job ran
-under — the same accessor-gap family already noted for calibration identity
-under Device Introspection. The run-request envelope was assembled inside the
-device implementation (see Runtime Submission), so the caller never held the
-submission document either. The shim's normalized record from the QDMI leg
-reduces to status plus counts: `job: {status: completed}`, empty `extensions`.
+Job identity is available. QDMI defines `QDMI_JOB_PROPERTY_ID`, QDMI-on-IQM
+answers it with the IQM job id (`QDMI-on-IQM/src/iqm_device.cpp`,
+`QDMI_DEVICE_JOB_PROPERTY_ID` -> `job->job_id_`), and FoMaC exposes it as the
+`Job.id` property. Provider-job correlation is therefore supported on this
+path.
 
-`QDMI_job_query_property` is the natural place for such identity to surface if
-a standard job-identity property were defined; the gap observed here is that no
-such property is reachable through the current FoMaC path.
+Calibration identity is not. No job or device property returns the calibration
+set a job ran under — the same accessor gap already noted for calibration
+identity under Device Introspection. The run-request envelope was assembled
+inside the device implementation (see Runtime Submission), so the caller never
+held the submission document either, and no provenance of what was actually
+submitted is retrievable from the job.
+
+Timing is also absent. The FoMaC job object exposes no submission, queue, or
+execution timestamps, so any duration on this path is measured by the caller
+around its own calls rather than reported by the provider.
+
+</details>
+
+<details>
+<summary><strong>Note On An Earlier Reading Of This Axis</strong></summary>
+
+An earlier revision of this section reported that no accessor returned the
+provider job id, based on QDMI-path result records that carried only
+`job: {status: completed}`. That was a defect in the QFw shim, not an interface
+limitation: the driver called the property as a method (`job.id()`), and a
+bare `except` swallowed the resulting `TypeError` (fixed in openQSE/QFw #33).
+
+The episode is itself relevant to the Error Model axis. A silent fallback made
+a caller bug look like a missing interface capability, and it survived a live
+hardware run because the absent field was indistinguishable from a field the
+provider does not supply. Interface comparisons drawn from observed payloads
+need the negative results checked against the interface definition before they
+are treated as interface findings.
 
 </details>
 
@@ -453,30 +476,39 @@ and provenance:
 
 | Normalized-record field | QRMI leg | QDMI leg |
 |---|---|---|
-| `result.counts` | `{'1': 10}` | `{'1': 10}` |
-| `job.id` | IQM job UUID | absent |
-| `job.provider_status` | `completed` | absent |
-| `calibration.id` | present | absent |
-| `extensions` | `iqm.v1`: run request + measurement sets | `{}` |
+| Field | QRMI | QDMI | Difference is |
+|---|---|---|---|
+| `result.counts` | `{'1': 10}` | `{'1': 10}` | — |
+| job identity | task id is the IQM job id | `QDMI_JOB_PROPERTY_ID` / `Job.id` | none; both supply it |
+| provider status | `completed` | job status enum | none |
+| calibration identity | in the target document | not exposed | interface |
+| submitted-request provenance | caller holds the run request | assembled internally, not returned | interface |
+| provider timing | none through `task_result` | no job timestamps | neither supplies it |
 
-The asymmetry is a direct consequence of where the run request is assembled.
-The layer that builds the envelope is the layer that holds the job identity,
-the calibration selection, and the execution options. QRMI leaves assembly with
-the caller, so the caller has all of it. QDMI-on-IQM assembles inside the
-device library, and nothing hands identity or provenance back up.
+Both interfaces supply job identity, so provider-job correlation is available
+on either path. The real asymmetry is narrower than the payloads first suggest,
+and it follows from where the run request is assembled. The layer that builds
+the envelope is the layer that holds the calibration selection and the
+execution options. QRMI leaves assembly with the caller, so the caller retains
+the submitted document. QDMI-on-IQM assembles it inside the device library and
+returns no record of what was submitted.
 
-The practical consequence is traceability: a QDMI-path run currently cannot be
-correlated with the provider-side job after the fact. For scheduler accounting,
-usage reconciliation, or incident forensics on a shared instrument, that is a
-real hole — the site knows a job ran, but not which provider job it was, or
-against which calibration.
+The practical consequence is provenance rather than correlation. A site can
+always tie its run to a provider job id. What it cannot reconstruct from the
+QDMI path is what was actually submitted and against which calibration set —
+which is what usage reconciliation and incident forensics on a shared
+instrument need beyond the id itself.
 
-For a common spec: the job lifecycle needs a standard provider-job-identity
-property on the job object (QRMI already returns it as the task id; QDMI's
-`QDMI_job_query_property` is the natural hook), and a defined provenance
-record — what was actually submitted, with which calibration selection and
-options — retrievable from the job regardless of which layer assembled the
-envelope.
+Neither interface reports provider-side timing on the paths exercised here.
+Queue time and execution time are not separable from either, so a caller can
+measure only total wall time around its own calls. That limits any comparative
+latency work to end-to-end numbers and is a gap for both.
+
+For a common spec: job identity is already common ground and should be
+standardized as such. The parts that need definition are a provenance record —
+what was submitted, with which calibration selection and options, retrievable
+from the job regardless of which layer assembled the envelope — and a timing
+model that distinguishes queue from execution.
 
 </details>
 
