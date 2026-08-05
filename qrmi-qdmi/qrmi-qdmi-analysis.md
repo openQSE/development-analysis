@@ -80,18 +80,126 @@ in the detailed sections that follow.
 
 ## Interface Role And Scope
 
+Which part of the stack is each interface trying to own? The names point at
+different answers — resource management against device management — and the
+structure of each project bears that out more clearly than any single call
+does. This axis is the frame for the rest of the document: several differences
+recorded elsewhere follow from the two occupying different layers.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI describes itself as a "thin and vendor agnostic layer to access, control
+and monitor underlying on-prem or cloud quantum computers". Its unit is a
+*resource*, and the whole interface is one `QuantumResource` trait of twelve
+async methods, with no separation between the API a caller uses and the API a
+vendor implements. A caller uses the trait that a resource implements.
+
+Vendor support lives inside the project. `src/` carries `ibm.rs`, `iqm.rs` and
+`alice_bob.rs` with their supporting modules, so adding a backend means adding
+code to QRMI and releasing QRMI. That is why `ResourceType` is a closed
+enumeration of seven backends: the set of supported vendors is a property of
+the QRMI build.
+
+The vocabulary is resource-management vocabulary — `acquire` / `release`,
+`ResourceProvider.resources`, a `least_busy` selector — and the deployment
+story is a scheduler's. Resources are discovered from a configured resource map
+or from the job environment a SLURM prologue populated, and the ecosystem
+includes a SPANK plugin to do that populating. QRMI expects something above it
+that has already decided which resources this job may touch.
+
+It also ships more than one binding: a Rust core, a generated C header
+(`cbindgen`), and Python bindings, which is consistent with wanting to sit
+under a variety of resource-manager and middleware code.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI's unit is a *device*, and the interface is explicitly two-sided. Two
+headers define two audiences:
+
+| Header | Functions | Implemented by |
+|---|---|---|
+| `client.h` | 15 | the interface itself; called by tools and applications |
+| `device.h` | 18 | the vendor, for each device |
+
+The device side mirrors the client side — `QDMI_device_initialize` /
+`_finalize`, `QDMI_device_session_alloc` / `_init` / `_free`, the three
+`_query_*_property` calls, `QDMI_device_session_create_device_job`, and the
+job operations — so a vendor implements a defined ABI rather than contributing
+code to QDMI.
+
+That is the structural consequence: devices are separate shared libraries,
+loaded at runtime. In the QFw shim the IQM device library is loaded by path
+through MQT Core's FoMaC loader. The set of supported devices is a property of
+what is installed, not of what QDMI was built with.
+
+The vocabulary is device vocabulary — sites, operations, loci, program formats,
+typed properties — and there is no admission, reservation, scheduling or
+site-policy surface anywhere in either header. MQT Core's FoMaC sits above QDMI
+as a convenience layer for tools, which is the kind of consumer QDMI is shaped
+for: compilers, mappers, and analysis code that need to know what a device is
+and can do.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**They are not competing for the same slot.** QRMI is a resource-manager-facing
+interface: it wants to be what a scheduler or middleware layer calls to reach
+any vendor's machine, and it handles vendor plurality by absorbing vendors into
+its own tree. QDMI is a provider-facing contract: it defines what a device must
+implement so that tools above it can be vendor-neutral, and it handles vendor
+plurality by delegating to vendors behind an ABI. QRMI sits above where QDMI
+sits, and in principle a QRMI backend could be implemented over QDMI.
+
+Much of what this document records elsewhere follows from that. QRMI has
+`acquire` / `release` and QDMI has no admission primitive at all, because
+admission is a resource-manager concern and QDMI is not one. QDMI advertises
+capability per device while QRMI implies it from a type constant, because
+QDMI's whole purpose is describing devices to software that has not met them
+before. QRMI hands back raw vendor payloads while QDMI returns typed neutral
+values, because a resource manager is passing data through and a tool is
+consuming it.
+
+**The plurality models have different costs, and neither is free.** QRMI's
+concentrates integration effort in one project: every new backend is a change
+to QRMI, which gives consistency and a single place to reason about behaviour,
+at the price of the project becoming a bottleneck and of vendor code being
+maintained by people who do not own the hardware. The `acquire()` divergence
+recorded under Admission is a symptom — three backends in one tree with three
+different meanings for one call, and nothing forcing them into agreement.
+QDMI's model pushes effort to vendors and scales without a bottleneck, at the
+price that conformance is only as good as the ABI is specified, and that the
+caller depends on a library the project does not control. The calibration
+down-select recorded under Calibration And Quality Data is a symptom of that
+one: what reaches the caller is whatever the device library chose to map.
+
+**The shim flattens two layers into one, and pays for it.** QFw's
+`svc_lib_qpm` treats QRMI and QDMI as interchangeable providers of the same
+calls, selected per call by a hand-maintained capability map. That map exists
+because the two interfaces do not offer the same calls — which is not an
+oversight in either, but a consequence of their occupying different layers. The
+map is a useful experiment precisely because it makes the mismatch concrete,
+but it should not be mistaken for evidence that the two are alternatives.
+
+**For a common spec.** The first decision is which layer is being specified,
+because the two are separable and both are needed. A device contract says what
+a device is and can do; a resource contract says how work is admitted, placed,
+accounted and reported against a fleet of them. Trying to write one interface
+that does both produces exactly the tensions visible here — admission calls
+that mean different things per backend, capability that is implied rather than
+advertised, and telemetry that is neither the device's nor the scheduler's.
+
+If a two-layer split is adopted, QDMI's client/device separation is worth
+studying as precedent: it is the same shape as a caller API plus a provider ABI,
+with the property-query model allowing new properties without breaking the ABI.
+QRMI's contribution to that picture is the part QDMI does not attempt — the
+scheduler-facing side, where resources are discovered from a job environment
+and a site's decision is carried rather than re-made.
 
 </details>
 
