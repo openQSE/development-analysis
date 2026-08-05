@@ -62,18 +62,113 @@ in the detailed sections that follow.
 
 ## Device Discovery And Capability Advertisement
 
+Discovery is how software above the interface learns which devices exist;
+capability advertisement is how it learns what each one accepts, so it can
+decide which device or implementation can satisfy a request. The two interfaces
+answer these from different places — one from site configuration, the other
+from the device.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+Discovery is configuration- and scheduler-driven, not a query to the provider.
+A resource is named, and the caller constructs it directly:
+
+```python
+qrmi = QuantumResource(resource_id, ResourceType.IQMServer)
+```
+
+The supporting machinery is local. `Config` (`load`, `resource_map`) reads a
+resource map; `ResourceDef` describes one entry (`name`, `resource_type`,
+`environment`, `is_dynamic`); `ResourceProvider` exposes `resources` over that
+set, plus a `least_busy` selector. In a batch deployment the set comes from the
+job environment: `get_job_qpu_resources_and_types()` reads
+`QRMI_JOB_QPU_RESOURCES` / `SLURM_JOB_QPU_RESOURCES` and the matching `_TYPES`
+variables, which the SPANK plugin populates — so the resource manager tells the
+job what it was given, and QRMI reads that answer rather than asking the
+device.
+
+`is_accessible()` then confirms a named resource is reachable.
+
+Capability is carried by the resource *type* rather than advertised by the
+resource. `ResourceType` enumerates seven backends (`IQMServer`,
+`IBMDirectAccess`, `IBMQiskitRuntimeService`, `IBMQuantumSystem`,
+`AliceBobFelis`, `PasqalCloud`, `PasqalLocal`) and `Payload` four variants
+(`IQMServer`, `QiskitPrimitive`, `AliceBobFelis`, `PasqalCloud`). Knowing the
+type tells the caller which payload to build, but that mapping is knowledge the
+caller must hold: it is not queryable, and there is no call that reports which
+program formats or which operations a given resource accepts. Every resource
+implements the same twelve-method trait, so the API surface is uniform by
+construction; whether a particular call is meaningful for a particular backend
+is found out by making it.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+Discovery is a query against the session. `QDMI_SESSION_PROPERTY_DEVICES`
+enumerates the devices a session can see, surfaced in MQT Core's FoMaC as
+`Session.get_devices()`. Devices reach a session through the driver's device
+libraries; in the QFw shim the IQM library is loaded explicitly by path with
+`add_dynamic_device_library`, which returns the device directly.
+
+Capability is advertised by the device and queried per property.
+`Device.supported_program_formats()` returns the formats that device accepts,
+drawn from a defined vocabulary of fourteen (`QASM2`, `QASM3`, four `QIR_*`
+variants, `QPY`, `IQM_JSON`, `CALIBRATION`, and five `CUSTOM` slots). Alongside
+it are `name()`, `version()`, `library_version()`, `status()`,
+`qubits_num()`, `needs_calibration()`, and the `sites()` / `operations()`
+model, which states which operations are available on which loci.
+
+The negative answer is typed as well: a property a device does not implement
+returns `QDMI_ERROR_NOTSUPPORTED` rather than an empty or invented value, so
+absence of a capability is distinguishable from absence of data.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**The two answer "what is out there" from opposite directions.** QRMI takes the
+answer from the site: a configured resource map, or the job environment the
+scheduler populated. QDMI takes it from the session: an enumeration of the
+devices its loaded device libraries expose. Neither is obviously the right
+default. QRMI's model fits an HPC deployment, where the resource manager has
+already decided what a job may touch and the interface should not offer more;
+QDMI's fits a client that must find out what is reachable before deciding.
+They are complementary rather than competing, and a common spec plausibly needs
+both: an enumeration call, and the ability for a resource manager to constrain
+what that enumeration returns.
+
+**They differ more sharply on capability.** QRMI advertises nothing per
+resource; capability is implied by the resource type, and the type-to-payload
+mapping lives in the caller. QDMI advertises per device and per property, with
+program formats as an explicit list and `QDMI_ERROR_NOTSUPPORTED` as a typed
+negative. That difference is the same one visible in Runtime Submission: QDMI
+declares the program format separately from the program bytes, so it has
+somewhere to put a format negotiation; QRMI's payload is typed by resource, so
+format compatibility is not expressible at the interface at all.
+
+**A caller that spans both must supply the missing model itself.** The QFw shim
+routes each API call to a library per resource, and it does so from a
+hand-maintained capability map in its descriptor — which calls each library
+serves for each device, plus a preference to break ties when both do. That map
+exists because neither interface can answer "which of these calls will work for
+this resource": QRMI does not advertise capability, and QDMI advertises what
+the *device* supports rather than what the *interface path* supports. The map
+is therefore maintained by hand and can drift from the libraries it describes —
+which it did, silently, until a routing assertion failed.
+
+**For a common spec.** Discovery should be a call, with the resource manager
+able to scope its results, so the same API serves both the constrained batch
+case and the exploratory client case. Capability advertisement should be
+queryable per resource rather than implied by a type constant, should cover
+accepted program formats explicitly, and should use a typed
+not-supported answer so that unsupported and unavailable are distinguishable.
+The test is whether a portable caller can select a device and construct a valid
+request without holding out-of-band knowledge about the backend — which today
+it cannot do through either interface alone.
 
 </details>
 
