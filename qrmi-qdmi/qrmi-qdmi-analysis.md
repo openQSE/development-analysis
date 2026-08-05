@@ -11,6 +11,37 @@ consumers. Applications, resource managers, schedulers, operators, monitoring
 services, and authentication services do not need the same calls. The axes below
 split the interface by function so each category can be evaluated on its own.
 
+## Versions Under Comparison
+
+Both libraries are moving quickly, and much of what follows is behavioural
+rather than architectural — error propagation, what a payload contains, what an
+implementation costs. Those observations are only meaningful against a stated
+version, and several are expected to change. Anything recorded here should be
+re-checked before being carried into a specification decision.
+
+Unless an entry says otherwise, observations were made against:
+
+| Component | Version | Role |
+|---|---|---|
+| `qrmi` | 0.17.2 | QRMI interface and its IQM resource implementation |
+| `iqm-qdmi` | 1.2.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
+| `mqt-core` | 3.7.0 | QDMI headers and the FoMaC layer the Python caller uses |
+| `iqm-client` | 34.0.1 | IQM Server client used by the QFw drivers |
+| `iqm-station-control-client` | 12.1.1 | IQM station-control models |
+| `iqm-pulse` | 13.0.1 | IQM circuit objects produced by transcoding |
+| `qhw-iqm` | 0.1.0 | normalization of IQM data into `qhw-*` records |
+
+Hardware observations are against the ORNL IQM 20-qubit device, reached through
+the QFw shim (`openQSE/QFw`, `services/svc_lib_qpm`).
+
+On source citations. Where this document cites QDMI-on-IQM source it means the
+corresponding upstream tag, not any local working tree — `iqm-qdmi` ships as a
+wheel containing a compiled device library, so a checkout used for reading is
+not necessarily the code that ran. Line numbers in citations written before this
+record was added predate it and have been observed to point at earlier
+versions; treat the symbol or function name as the reliable anchor and the line
+number as a hint.
+
 **Status (2026-07-28):** the comparison now has live-hardware backing. Both
 interfaces ran against the ORNL IQM 20-qubit system through the QFw shim:
 device introspection through each returned the same normalized topology (20
@@ -891,10 +922,11 @@ Cost of observing. The IQM device library fetches during session init, so the
 cost is paid when the device is opened; property queries afterwards are local
 reads. Measured on the same device and path: 3376.8 ms median cold (5 samples,
 3193-3397 ms), then 12-17 ms for repeat queries, no network. Session init opens
-**five separate TCP connections** — five TLS handshakes. QDMI-on-IQM calls
-`curl_easy_init()` per request and `curl_easy_cleanup()` after it
-(`QDMI-on-IQM/src/internal/curl_http_client.cpp`); libcurl's connection cache
-lives on the easy handle, so each request reconnects.
+**five separate TCP connections** — five TLS handshakes. QDMI-on-IQM issues each
+request through cpr's free-function API (`cpr::Get` / `cpr::Post` in
+`src/internal/http_client.cpp`), which constructs and destroys a session, and
+with it the underlying libcurl handle and its connection cache, per call. No
+session is retained across requests, so each one reconnects.
 
 </details>
 
@@ -928,8 +960,8 @@ pattern a resource manager uses.
 explained by request count, which is three against roughly five. It is
 explained by connection reuse: one pooled connection and one TLS handshake
 against five connections and five handshakes. This is a property of the
-QDMI-on-IQM implementation, fixable there with a shared or reused curl handle,
-and it should not be read as a property of the QDMI interface.
+QDMI-on-IQM implementation, fixable there by retaining a session across
+requests, and it should not be read as a property of the QDMI interface.
 
 **Why this was measured over a wide-area path, and why that is not a
 disclaimer.** These numbers were taken from outside the site, over an SSH
