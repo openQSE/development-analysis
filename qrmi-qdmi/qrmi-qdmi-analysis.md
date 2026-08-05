@@ -747,18 +747,125 @@ raw calibration and quality-metric observation sets.
 
 ## Telemetry
 
+Telemetry is runtime health, load, queue state, availability, timing, and
+operational counters — what software above the interface can observe about a
+device while it is running, and what that observation costs. The cost half
+matters as much as the content: a runtime that cannot afford to look cannot use
+what is exposed.
+
+The figures below are measured, not read from source. Method and raw data are
+in `openQSE/QFw`, `examples/measure_shim_introspection.py` and
+`examples/measurements/`.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+The observability surface on `QuantumResource` is `is_accessible()` for
+reachability, `metadata()`, and `target()`, whose payload carries the IQM
+quality-metric set alongside the architecture and calibration data. Job-level
+state is `task_status()`, with `task_logs()` for provider logs.
+
+There is no queue-state call. In the QFw result record the metadata block
+carries a `queue_position` field, which the IQM path leaves null. `task_result`
+returns measurement JSON and no timestamps, so no provider-side timing reaches
+the caller (see Job Lifecycle And Results).
+
+Cost of observing. `target()` issues three IQM REST calls and the shim driver
+caches the parsed document per driver instance, so the cost is paid once per
+instance. Measured against the ORNL 20-qubit device from outside the site:
+1334.6 ms median to open and complete a first introspection (5 samples,
+1238-1500 ms), then 11-18 ms for repeat calls with no network involved. The
+three REST calls travel over a **single pooled TCP connection** — one TLS
+handshake — because the Rust client reuses connections.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+The device carries a typed status property (`QDMI_DEVICE_PROPERTY_STATUS`,
+surfaced by FoMaC as `Device.status()`), plus `needs_calibration()` and the
+per-site and per-operation quality values described under Calibration And
+Quality Data. Job state is the status enum from `Job.check()`.
+
+There is no queue-state property, and the job object exposes no submission,
+queue, or execution timestamps — so, as on the QRMI side, queue time and
+execution time are not separable by the caller.
+
+Cost of observing. The IQM device library fetches during session init, so the
+cost is paid when the device is opened; property queries afterwards are local
+reads. Measured on the same device and path: 3376.8 ms median cold (5 samples,
+3193-3397 ms), then 12-17 ms for repeat queries, no network. Session init opens
+**five separate TCP connections** — five TLS handshakes. QDMI-on-IQM calls
+`curl_easy_init()` per request and `curl_easy_cleanup()` after it
+(`QDMI-on-IQM/src/internal/curl_http_client.cpp`); libcurl's connection cache
+lives on the easy handle, so each request reconnects.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**What is exposed.** Both interfaces report device-level state — reachability
+and quality data on the QRMI side, a typed device status and calibration
+signals on the QDMI side — and both report job state. Neither exposes queue
+depth, queue position, device load, or any provider timestamp. A scheduler
+cannot ask either interface how busy the device is, or learn afterwards how
+much of a job's elapsed time was queueing rather than execution. That is a
+symmetric gap, and it caps what any comparative or capacity-planning work can
+conclude: total wall time measured by the caller is the only timing available
+from either.
+
+**What observation costs.** Both architectures already make repeat observation
+nearly free — QRMI by caching the target document per driver instance, QDMI by
+serving property queries from an initialized session. Measured repeat cost is
+11-18 ms on both and involves no network on either, so it is dominated by
+record normalization rather than by the interface. Neither has a warm-path
+advantage.
+
+The difference is entirely in cold start, and it is large: 1334.6 ms for QRMI
+against 3376.8 ms for QDMI-on-IQM under identical conditions. That is the cost
+a component pays when it must observe from a fresh process — a per-job
+scheduler hook, a monitoring probe, a short-lived task — which is precisely the
+pattern a resource manager uses.
+
+**The cause is transport handling, not interface design.** The gap is not
+explained by request count, which is three against roughly five. It is
+explained by connection reuse: one pooled connection and one TLS handshake
+against five connections and five handshakes. This is a property of the
+QDMI-on-IQM implementation, fixable there with a shared or reused curl handle,
+and it should not be read as a property of the QDMI interface.
+
+**Why this was measured over a wide-area path, and why that is not a
+disclaimer.** These numbers were taken from outside the site, over an SSH
+tunnel to the device. That inflates every round trip, and on a local network
+the absolute figures and the ratio would both be smaller. It would be a mistake
+to treat the wide-area case as an artifact to be corrected away: remote use of
+quantum resources is an expected deployment, not an anomaly. Instruments are
+shared between sites, hybrid workflows reach devices that are not local to the
+compute, and provider-hosted devices are reached over the public internet by
+construction.
+
+Under that condition the connection-handling difference stops being a
+micro-optimization. Four extra TLS handshakes are close to invisible at
+sub-millisecond round-trip time and dominant at hundreds of milliseconds. The
+same implementation choice is therefore negligible locally and
+deployment-limiting remotely, and a comparison run only on a local network
+would not have surfaced it at all. Latency-sensitive differences deserve to be
+measured under latency, precisely because that is where they decide whether a
+usage pattern is viable.
+
+**For a common spec.** Three requirements follow. First, a timing model that
+distinguishes queue from execution, since neither interface supplies one today
+and no amount of caller-side instrumentation can recover it. Second, queue and
+load state as first-class telemetry, so admission and scheduling decisions can
+be made on observed device state rather than inferred from failures. Third,
+transport expectations stated in the specification rather than left to each
+provider implementation — connection reuse in particular. The observation cost
+of an interface is part of its contract with a resource manager, and the
+evidence here is that leaving it unspecified produces a 2.5x difference between
+implementations of the same interface, concentrated exactly where remote
+deployments are most sensitive.
 
 </details>
 
