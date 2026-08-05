@@ -209,18 +209,113 @@ it cannot do through either interface alone.
 
 ## Admission
 
+Admission is the resource-manager-facing decision path: accept a quantum
+resource request now, delay it, or reject it. The question for each interface
+is what a site scheduler can call to make that decision, and what a successful
+call actually guarantees.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI has admission-shaped primitives. `is_accessible()` reports reachability,
+and for IQM it is real: it calls the provider's health endpoint
+(`get_qc_health_v1`) and returns the reported health. `acquire()` and
+`release()` bracket a claim on the resource, and `ResourceProvider` offers a
+`least_busy` selector over the configured set.
+
+What `acquire()` means depends on the backend, and the caller cannot tell which
+it got.
+
+| Backend | `acquire()` |
+|---|---|
+| IBM Qiskit Runtime Service | real: refreshes credentials, reuses or creates a provider session |
+| IBM Direct Access | `Ok(Uuid::new_v4().to_string())` — a generated id, no provider contact |
+| IQM Server | `Ok(Uuid::new_v4().to_string())` — a generated id, no provider contact |
+
+For IQM, `release()` is `Ok(())`. Both return success and neither reaches the
+device. The IQM implementation's doc comment describes behaviour it does not
+have — "Deletes the current session. This sends a DELETE request to
+`/sessions/{session_id}/close`" — which is the Qiskit Runtime text left in
+place. The Direct Access implementation is at least honest about it: "Direct
+Access does not support session concept, so simply returns dummy ID for now."
+
+There is no capability flag distinguishing the two cases. A resource manager
+that calls `acquire()` receives a token whether or not anything was reserved.
+
+Separately, QRMI ships a SLURM SPANK plugin, and that is where site admission
+actually happens in a batch deployment: the scheduler decides, and the prologue
+publishes the granted resources into the job environment for
+`get_job_qpu_resources_and_types()` to read. Admission is the scheduler's, and
+QRMI's role is to carry the result.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI has no admission primitive. The client API is fifteen functions covering
+sessions, device and property queries, and the job lifecycle:
+
+```
+QDMI_session_alloc / _init / _set_parameter / _query_session_property
+QDMI_device_query_device_property / _query_site_property / _query_operation_property
+QDMI_device_create_job
+QDMI_job_set_parameter / _submit / _check / _wait / _get_results / _query_property / _cancel
+```
+
+There is no acquire, reserve, lease, or lock. A session is a client-side
+context for reaching devices, not a claim on one, and nothing in the interface
+lets a caller ask to hold a device or be told to wait.
+
+What exists that bears on admission is observational: the typed device status
+(`QDMI_DEVICE_PROPERTY_STATUS`) and `needs_calibration()` let a caller decide
+not to submit. Beyond that, work is submitted and the provider's own queue
+decides when it runs. `QDMI_job_cancel` withdraws a job after the fact.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**Neither interface gives a site scheduler a device-aware admission decision.**
+QDMI has no admission call at all. QRMI has one whose meaning varies by
+backend, and for IQM it is a no-op that returns success. Both leave the real
+decision to the provider's queue, which the caller cannot see into.
+
+**QRMI's version is the more instructive failure.** A no-op that returns a
+plausible token is worse than an absent call, because it is indistinguishable
+from a working one. A resource manager written against `acquire()` will behave
+correctly on IBM Qiskit Runtime and silently hold nothing on IQM and IBM Direct
+Access, with no error, no warning, and no capability flag to check. This is the
+Device Discovery gap with consequences: capability is not advertised, so a
+caller cannot ask whether the primitive it is about to rely on is implemented.
+That an implementation carries another backend's documentation for behaviour it
+does not have is a symptom of the same thing.
+
+**Admission needs the telemetry neither interface supplies.** Deciding to
+accept, delay, or reject requires knowing what the device is doing — queue
+depth, current load, expected wait. As recorded under Telemetry, neither
+interface exposes any of it, and the provider timing that would at least allow
+learning from history is discarded by both. So even a correct admission call
+would have nothing to decide on. The two gaps compound: no state to decide
+from, and no primitive that reliably enforces a decision.
+
+**What works today is outside the interface.** In a batch deployment the
+scheduler admits, and QRMI's SPANK plugin publishes the outcome into the job
+environment. That is a real, working admission path, and it is worth being
+precise about why: SLURM owns the decision because it holds the state — the
+queue, the allocation, the policy. Neither quantum interface holds any of that.
+
+**For a common spec.** Three things follow. An admission primitive must have
+defined semantics and be discoverable: if a resource does not support holding,
+the caller must be able to learn that before relying on it, and a call that
+cannot enforce should fail rather than return a token. Admission needs the
+device-state telemetry to be a decision rather than a guess, which makes this
+axis dependent on Telemetry rather than separable from it. And the division of
+labour with the site scheduler should be stated deliberately — the resource
+manager is likely to remain the admitting authority, in which case the
+interface's job is to give it device state and to honour, not duplicate, its
+decisions.
 
 </details>
 
