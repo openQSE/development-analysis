@@ -37,10 +37,14 @@ the QFw shim (`openQSE/QFw`, `services/svc_lib_qpm`).
 On source citations. Where this document cites QDMI-on-IQM source it means the
 corresponding upstream tag, not any local working tree — `iqm-qdmi` ships as a
 wheel containing a compiled device library, so a checkout used for reading is
-not necessarily the code that ran. Line numbers in citations written before this
-record was added predate it and have been observed to point at earlier
-versions; treat the symbol or function name as the reliable anchor and the line
-number as a hint.
+not necessarily the code that ran.
+
+Citations are anchored by symbol or function name rather than by line number
+wherever the file is one that moves. Line numbers were tried first and did not
+survive: every QDMI-on-IQM line reference in Calibration And Quality Data had
+drifted by the time it was rechecked at 1.2.0, and the QFw ones had been moved
+by later commits to those same files. The `qrmi` references retain line numbers
+because they were verified against the pinned 0.17.2 tag, which is not moving.
 
 **Status (2026-07-28):** the comparison now has live-hardware backing. Both
 interfaces ran against the ORNL IQM 20-qubit system through the QFw shim:
@@ -729,10 +733,10 @@ boundary. The QFw shim receives complete IQM endpoint responses and then lets
 
 - The QRMI shim driver calls `self._qpu().target().value`, parses the returned
   JSON, and caches it for the driver instance
-  (`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py:175-186`).
+  (`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py`, `_target()`).
 - `get_calibration_snapshot()` maps the QRMI target fields into the shape
   expected by `qhw_iqm.normalize_calibration`
-  (`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py:212-226`).
+  (`QFw/services/svc_lib_qpm/drivers/qrmi_driver.py`, `get_calibration_snapshot()`).
 - The mapping is direct: QRMI `dynamic_quantum_architecture` becomes
   `dynamic_architecture`, QRMI `calibration_set` remains `calibration_set`,
   and QRMI `quality_metrics` becomes `quality_metric_set`.
@@ -765,12 +769,12 @@ endpoints:
 **Normalized Output**
 
 - `qhw-iqm` reads the full `calibration_set` and `quality_metric_set` objects
-  (`qhw-iqm/src/qhw_iqm/normalize.py:138-160`).
+  (`qhw-iqm/src/qhw_iqm/normalize.py`, `normalize_calibration()`).
 - `normalize_calibration()` counts both observation arrays and stores the IQM
   observation sets under `extensions["iqm.v1"]`
-  (`qhw-iqm/src/qhw_iqm/normalize.py:174-219`).
+  (`qhw-iqm/src/qhw_iqm/normalize.py`, `normalize_calibration()`).
 - `_iqm_observation_set()` preserves the observation-set identity fields and the
-  full `observations` arrays (`qhw-iqm/src/qhw_iqm/normalize.py:444-460`).
+  full `observations` arrays (`qhw-iqm/src/qhw_iqm/normalize.py`, `_iqm_observation_set()`).
 
 The QRMI raw target contains the full provider endpoint responses. The
 qhw-normalized calibration record still contains the full calibration and
@@ -789,49 +793,54 @@ them through FoMaC.
 **QFw Entry Point**
 
 - QFw opens the IQM QDMI shared library through MQT Core's FoMaC loader
-  (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py:89-119`).
+  (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py`, `_device()`).
 - `get_calibration_snapshot()` calls
   `fomac_normalize.extract_calibration(self._device())`
-  (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py:145-152`).
+  (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py`, `get_calibration_snapshot()`).
 - The QFw extractor can only ask the FoMaC/QDMI object for standardized
   accessors: per-site `t1()` and `t2()`, per-operation `fidelity()` and
   `duration()`, and the device duration unit
-  (`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:47-78` and
-  `QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:243-271`).
+  (`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py`,
+  `extract_calibration()` and its locus helpers).
 - The normalized record stores only `qubit_metrics`, `gate_metrics`, and
   `duration_unit` under `extensions["qdmi.fomac.v1"]`
-  (`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py:123-164`).
+  (`QFw/services/svc_lib_qpm/drivers/fomac_normalize.py`,
+  `to_calibration_record()`).
 
 **QDMI-on-IQM Fetch And Down-Select**
 
 - The IQM device session stores site identity, `t1_`, `t2_`, and operation
-  fidelity maps (`QDMI-on-IQM/src/iqm_device.cpp:104-137` and
-  `QDMI-on-IQM/src/iqm_device.cpp:205-210`).
+  fidelity maps (`QDMI-on-IQM/src/iqm_device.cpp`, the session's `sites_map_` and the
+  per-site `t1_` / `t2_` members).
 - QDMI-on-IQM fetches the IQM quality-metrics endpoint
-  (`QDMI-on-IQM/src/internal/iqm_api_config.cpp:47-50` and
-  `QDMI-on-IQM/src/iqm_device.cpp:460-470`).
+  (`QDMI-on-IQM/src/internal/iqm_api_config.cpp`,
+  `GET_CALIBRATION_SET_QUALITY_METRICS`, fetched by
+  `Process_calibration_metrics()`).
 - `Process_calibration_metrics()` flattens valid observations into a
-  `dut_field -> value` map (`QDMI-on-IQM/src/iqm_device.cpp:479-488`).
+  `dut_field -> value` map (`QDMI-on-IQM/src/iqm_device.cpp`,
+  `Process_calibration_metrics()`).
 - The implementation then keeps only the fields it recognizes:
 
 | IQM `dut_field` pattern | Stored QDMI-on-IQM value | Code |
 |---|---|---|
-| `characterization.model.<qubit>.t1_time` | `site->t1_` | `QDMI-on-IQM/src/iqm_device.cpp:490-496` |
-| `characterization.model.<qubit>.t2_time` | `site->t2_` | `QDMI-on-IQM/src/iqm_device.cpp:497-502` |
-| `metrics.ssro.measure.<impl>.<qubit>.fidelity` | single-qubit fidelity map | `QDMI-on-IQM/src/iqm_device.cpp:508-521` |
-| `metrics.rb.prx.<impl>.<qubit>.fidelity:par=d2` | single-qubit fidelity map | `QDMI-on-IQM/src/iqm_device.cpp:524-538` |
-| `metrics.irb.cz.<impl>.<q1>__<q2>.fidelity:par=d2` | two-qubit fidelity map | `QDMI-on-IQM/src/iqm_device.cpp:541-557` |
+| `characterization.model.<qubit>.t1_time` | `site->t1_` | `Process_calibration_metrics()` |
+| `characterization.model.<qubit>.t2_time` | `site->t2_` | `Process_calibration_metrics()` |
+| `metrics.ssro.measure.<impl>.<qubit>.fidelity` | single-qubit fidelity map | `Process_calibration_metrics()` |
+| `metrics.rb.prx.<impl>.<qubit>.fidelity:par=d2` | single-qubit fidelity map | `Process_calibration_metrics()` |
+| `metrics.irb.cz.<impl>.<q1>__<q2>.fidelity:par=d2` | two-qubit fidelity map | `Process_calibration_metrics()` |
 
 **Exposed QDMI Properties**
 
 - Site queries expose index, name, T1, and T2
-  (`QDMI-on-IQM/src/iqm_device.cpp:1659-1685`).
+  (`QDMI-on-IQM/src/iqm_device.cpp`,
+  `IQM_QDMI_device_session_query_site_property()`).
 - Operation queries expose name, qubit count, parameter count, supported sites,
   and fidelity when a mapped fidelity exists
-  (`QDMI-on-IQM/src/iqm_device.cpp:1688-1791`).
+  (`QDMI-on-IQM/src/iqm_device.cpp`,
+  `IQM_QDMI_device_session_query_operation_property()`).
 - QDMI defines an operation duration property, and QFw asks for it through
   FoMaC. QDMI-on-IQM documents that IQM operation durations are not exposed by
-  this provider implementation (`QDMI-on-IQM/docs/usage.md:194-201`).
+  this provider implementation (`QDMI-on-IQM/docs/usage.md`).
 
 The QDMI path therefore provides portable calibration properties. It does not
 provide the raw IQM calibration or quality-metric observation sets to Python.
