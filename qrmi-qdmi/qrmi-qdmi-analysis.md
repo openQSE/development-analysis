@@ -942,28 +942,71 @@ session is retained across requests, so each one reconnects.
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
 
+These observations are measured against three paths, not two. QFw can reach the
+same device through QRMI, through QDMI, and through its own native service
+client (`svc_iqm_qpm`) calling `iqm-client` directly. The native arm is a
+control: it shows what each interface layer costs relative to not having one,
+and — more usefully here — what the provider makes available before an
+interface decides what to keep.
+
 **What is exposed.** Both interfaces report device-level state — reachability
 and quality data on the QRMI side, a typed device status and calibration
 signals on the QDMI side — and both report job state. Neither exposes queue
 depth, queue position, device load, or any provider timestamp. A scheduler
 cannot ask either interface how busy the device is, or learn afterwards how
-much of a job's elapsed time was queueing rather than execution. That is a
-symmetric gap, and it caps what any comparative or capacity-planning work can
-conclude: total wall time measured by the caller is the only timing available
-from either.
+much of a job's elapsed time was queueing rather than execution.
 
-**What observation costs.** Both architectures already make repeat observation
-nearly free — QRMI by caching the target document per driver instance, QDMI by
-serving property queries from an initialized session. Measured repeat cost is
-11-18 ms on both and involves no network on either, so it is dominated by
-record normalization rather than by the interface. Neither has a warm-path
-advantage.
+**That gap is not the provider's.** The native client reads the IQM job
+timeline and reports the phases directly: queue wait, validation, compilation,
+execution, post-processing, and a server-side total. A measured run gave 34.9
+ms of queue wait and 107.3 ms of execution on a circuit whose client-side
+elapsed time was several seconds. The same device, through either interface,
+reports none of it.
 
-The difference is entirely in cold start, and it is large: 1334.6 ms for QRMI
-against 3376.8 ms for QDMI-on-IQM under identical conditions. That is the cost
-a component pays when it must observe from a fresh process — a per-job
-scheduler hook, a monitoring probe, a short-lived task — which is precisely the
-pattern a resource manager uses.
+So queue-versus-execution is not information that has to be invented for a
+common spec, nor obtained by instrumenting callers. It exists at the provider
+and is discarded in the layer above. QRMI's `task_result` carries measurement
+JSON and drops the timeline that accompanied it; QDMI's job object exposes no
+timestamp property at all. That is a stronger and more actionable finding than
+a symmetric absence: the requirement is to preserve what the provider already
+sends, not to construct something new.
+
+It also bounds what the interfaces can support. Any scheduler decision that
+depends on distinguishing a busy device from a slow interface — backpressure,
+capacity planning, SLA accounting, deciding whether a queue is worth waiting
+in — is unavailable through either interface today and available natively.
+
+**What observation costs.** Both interfaces make repeat observation nearly
+free — QRMI by caching the target document per driver instance, QDMI by serving
+property queries from an initialized session. Measured repeat cost is 11-18 ms
+on both, involves no network on either, and is dominated by record
+normalization rather than by the interface. Neither has a warm-path advantage
+over the other.
+
+Both have a large one over the native client, which caches nothing. Every
+introspection call on the native path re-fetches: 512.6 ms for a repeat
+`get_device_info` against 11.8 ms and 13.1 ms, and 25 fresh connections across
+a warm phase where both interfaces opened none. The same absence shows up in
+execution, where the native path re-reads the dynamic architecture inside
+`run_circuit` while the interfaces serve it from cache.
+
+This is worth stating plainly because the framing of an interface layer is
+usually what it costs. Here, on the most common access pattern — ask the same
+device something more than once — both interfaces are roughly forty times
+cheaper than talking to the provider directly, because both introduced a cache
+the provider client does not have.
+
+The difference between the two interfaces is entirely in cold start, and it is
+large: 1334.6 ms for QRMI against 3376.8 ms for QDMI-on-IQM under identical
+conditions, with the native client at 2831.1 ms in the same three-arm run. That
+is the cost a component pays when it must observe from a fresh process — a
+per-job scheduler hook, a monitoring probe, a short-lived task — which is
+precisely the pattern a resource manager uses.
+
+Note where the native baseline falls: slower than QRMI, close to QDMI-on-IQM.
+Neither interface imposes a cold-start penalty over talking to the provider
+directly. QRMI is faster than the native client cold, for the same reason it is
+faster than QDMI-on-IQM — it reuses one connection where the others do not.
 
 **The cause is transport handling, not interface design.** The gap is not
 explained by request count, which is three against roughly five. It is
@@ -991,17 +1034,34 @@ would not have surfaced it at all. Latency-sensitive differences deserve to be
 measured under latency, precisely because that is where they decide whether a
 usage pattern is viable.
 
-**For a common spec.** Three requirements follow. First, a timing model that
-distinguishes queue from execution, since neither interface supplies one today
-and no amount of caller-side instrumentation can recover it. Second, queue and
-load state as first-class telemetry, so admission and scheduling decisions can
-be made on observed device state rather than inferred from failures. Third,
-transport expectations stated in the specification rather than left to each
-provider implementation — connection reuse in particular. The observation cost
-of an interface is part of its contract with a resource manager, and the
-evidence here is that leaving it unspecified produces a 2.5x difference between
-implementations of the same interface, concentrated exactly where remote
-deployments are most sensitive.
+**For a common spec.** Four requirements follow.
+
+First, provider-reported timing must survive the interface. The native arm
+shows the phases are already there — queue wait, validation, compilation,
+execution — so the requirement is passthrough with a defined shape, not a new
+timing model. An interface that reduces a job result to counts plus a status
+has thrown away the only data that distinguishes a busy device from a slow
+path.
+
+Second, queue and load state as first-class telemetry, so admission and
+scheduling decisions can be made on observed device state rather than inferred
+from failures.
+
+Third, transport expectations stated in the specification rather than left to
+each provider implementation — connection reuse in particular. The observation
+cost of an interface is part of its contract with a resource manager, and
+leaving it unspecified produced a 2.5x difference between implementations of
+the same interface, concentrated exactly where remote deployments are most
+sensitive.
+
+Fourth, caching belongs in the contract too. Both interfaces added one and the
+provider client did not, which is why both are dramatically cheaper on repeat
+observation — but neither states a policy, so a caller cannot know whether a
+value is fresh, how stale it may be, or how to force a re-read. Today that is
+an accident of implementation that happens to favour the interfaces. A
+specification should say what is cached, for how long, and how to bypass it,
+because a scheduler acting on calibration data needs to know whether it is
+reading the device or a memory of it.
 
 </details>
 
