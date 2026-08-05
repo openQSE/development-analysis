@@ -1559,17 +1559,120 @@ interface is embedded as a library, not only in its standalone binaries.
 
 ## Extensibility And Versioning
 
+How does each interface grow, how does it advertise an optional feature, and
+what breaks when it changes? The two answers differ sharply, and — as with
+several axes here — the difference follows from where each sits: QDMI must keep
+an ABI stable because vendors ship libraries independently, while QRMI carries
+its vendors in-tree and so has never needed to.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+Growth happens by editing the interface. The two extension points are closed
+Rust enums — `ResourceType` with seven backends and `Payload` with four
+variants — so supporting a new machine means adding a variant, and adding a
+variant means releasing QRMI. Downstream code that matches exhaustively on
+either sees a breaking change.
+
+The `QuantumResource` trait is a single surface of twelve methods, and every
+resource implements all of them. There is no way to implement a subset, and no
+declaration that a method is unsupported for a given backend, which is the
+mechanism behind the `acquire()` behaviour recorded under Admission: a resource
+with no session concept still has to return something, so it returns a
+generated identifier.
+
+There is no runtime version discovery. A caller cannot ask a resource which
+QRMI version it implements, and there is no capability query to probe an
+optional feature with. Combined with the error model — failures surface as
+exceptions carrying strings rather than typed codes — a caller cannot reliably
+distinguish "this backend does not support that" from "that call failed".
+
+The one place QRMI does version explicitly is the payload. The repository ships
+`qrmi_payload_v1_schema.json`, a JSON Schema with four `oneOf` variants
+distinguished by their required fields (`program_id` + `parameters`, `job_runs`
++ `sequence`, `human_qir` + `input_params`, `iqmjson` + `job_type`). Note that
+the file is named `v1` while the schema's own `version` field reads `0.4.0`. It
+versions the payload, not the interface.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+Growth happens by adding property values, not by changing signatures. Every
+query goes through a generic accessor — `QDMI_device_query_device_property`,
+`_query_site_property`, `_query_operation_property`, `QDMI_job_query_property`,
+`QDMI_session_query_session_property` — taking a property enum plus a sized
+output buffer. A new property is a new enum value; the function signature, and
+therefore the ABI, does not move.
+
+Optional features are answered rather than guessed at. A property an
+implementation does not provide returns `QDMI_ERROR_NOTSUPPORTED`, one of
+eleven typed codes that also include `NOTIMPLEMENTED`, `NOTFOUND`,
+`PERMISSIONDENIED` and `LIBNOTFOUND`. A caller can probe and receive a defined
+answer, which is what makes a partial implementation expressible rather than
+something to be worked around.
+
+Vendor-specific extension has reserved space: five `CUSTOM` slots in each
+property family — device, site, operation, job and session properties, and job
+parameters. QDMI-on-IQM uses them, passing the quantum-computer alias as a
+session parameter and exposing raw IQM device data through
+`QDMI_DEVICE_PROPERTY_CUSTOM1`.
+
+Version is discoverable at runtime through the device itself:
+`QDMI_DEVICE_PROPERTY_VERSION` for the device and
+`QDMI_DEVICE_PROPERTY_LIBRARYVERSION` for the QDMI version its library
+implements. A caller that has just loaded an unfamiliar device library can ask
+what it speaks before relying on it.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**One can grow without breaking; the other cannot.** QDMI adds capability by
+adding enum values behind unchanging function signatures, so a device library
+built against an older header keeps working and an updated caller learns what
+is missing through `NOTSUPPORTED`. QRMI adds capability by adding enum variants
+and trait methods, both of which are breaking changes, and offers no way to
+express partial support. That is the difference between an interface designed
+to be implemented by parties who release on their own schedule and one designed
+to be edited in place.
+
+**The monolithic trait is the root of several findings elsewhere.** The axis
+description asks whether provider implementations can evolve without treating
+the interface as one monolith. QRMI's twelve-method trait is exactly that
+monolith: every backend must present every method, so methods that are
+meaningless for a backend become no-ops rather than honest absences. The
+`acquire()` divergence under Admission and the missing capability advertisement
+under Device Discovery are not three separate oversights — they are one design
+choice observed from three directions.
+
+**Reserved custom slots are extensibility without portability.** QDMI's five
+`CUSTOM` slots per family let a vendor expose anything without a spec change,
+which is genuinely useful and is how QDMI-on-IQM carries the IQM alias and its
+raw device data. But a custom slot means whatever its vendor decided, so
+portable code cannot use one, and two vendors will not agree on `CUSTOM1`.
+They are an escape hatch, and the more load they carry the less the neutral
+model is actually describing the device. Watching what accumulates in them is a
+good indicator of what the specification is missing.
+
+**Runtime version discovery is a real asymmetry.** QDMI lets a caller ask a
+just-loaded library which version it implements. QRMI has no equivalent,
+because the question does not arise when the vendor code ships in the same
+build — which is consistent, but means anything reusing QRMI's model with
+independently-released backends would have to add it.
+
+**For a common spec.** If the provider side is an ABI implemented by others —
+which the Interface Role axis argues is the right shape — then QDMI's
+mechanisms are close to the minimum needed: a generic property query so new
+capability does not move the ABI, a typed not-supported so partial
+implementations are expressible and discoverable, runtime version reporting,
+and reserved vendor space. To that should be added what neither has: a stated
+policy for what happens when a caller is newer than an implementation, and the
+discipline of treating accumulation in the custom slots as a backlog for the
+next revision rather than as a permanent home. And whichever model is chosen,
+capability must be declarable — the recurring cost across this document is that
+a caller cannot ask what a resource actually supports before depending on it.
 
 </details>
