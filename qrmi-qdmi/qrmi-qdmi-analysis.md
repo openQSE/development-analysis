@@ -429,35 +429,146 @@ decisions.
 
 ## Admission Control Configuration
 
+The operator-facing controls a site uses to select and tune admission policy:
+quality of service, allocation limits, rate limits, credit policy. This is the
+first of three consecutive axes covering operator surfaces, and the short
+answer for all three is that neither interface has one. That is not an
+oversight — it follows from the roles established in Interface Role And Scope —
+but it is worth recording precisely what each does have nearby, because the
+adjacent machinery is easy to mistake for policy.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+What QRMI has is deployment configuration, not policy. `Config` loads a
+resource map naming which resources exist and what type each is, and per-
+resource behaviour is tuned through environment variables keyed by resource id
+— `{backend}_QRMI_JOB_TIMEOUT_SECONDS`, and the credential and endpoint
+variables for each backend family.
+
+These are knobs, but they are not an operator control plane. They are read at
+construction by whichever process is using the resource, and in a batch
+deployment they are written into the job environment by the SPANK prologue. A
+site expresses policy by controlling what the prologue writes, which is to say
+by configuring SLURM, not QRMI. There is no call to set a limit, no quota or
+credit concept, and no rate limiting.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI has no admission policy surface at all. Its session parameters are
+identity and connection settings — `TOKEN`, `USERNAME`, `PASSWORD`, `AUTHFILE`,
+`AUTHURL`, `PROJECTID` — plus five custom slots. Job parameters are
+`PROGRAM`, `PROGRAMFORMAT`, `SHOTSNUM` and five custom slots. Nothing in either
+family expresses a limit, a quota, a rate, or a class of service.
+
+`QDMI_SESSION_PARAMETER_PROJECTID` is the closest thing to an allocation
+concept, and it is an input the caller supplies for the provider's own
+accounting rather than a control a site operator sets.
+
+What QDMI does offer admission is state to decide on: the device status
+enumeration is `IDLE`, `BUSY`, `CALIBRATION`, `MAINTENANCE`, `ERROR`,
+`OFFLINE`. That is a usable operational vocabulary, and it is an input to a
+decision, not a policy control.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+Neither interface lets a site operator configure admission, and the deployments
+in question do configure it — in SLURM, through partitions, QoS, association
+limits and reservations. The policy layer exists; it simply sits above both
+interfaces and knows nothing about quantum devices beyond what a GRES count
+expresses.
+
+The gap that matters is therefore not the missing controls but the missing
+inputs. A site scheduler already has the mechanisms to express quality of
+service and limits; what it cannot do is make those decisions device-aware,
+because as recorded under Telemetry neither interface reports queue depth,
+load, or expected wait. QDMI's status enumeration is the most useful thing
+either provides, and it distinguishes only six coarse states.
+
+**For a common spec.** If the resource manager remains the admitting authority
+— which Interface Role argues it should — then the interface's obligation is to
+supply decision inputs rather than to grow a policy API of its own: current
+load and queue depth, an expected-wait estimate, a device state vocabulary at
+least as rich as QDMI's, and enough accounting identity to reconcile usage
+afterwards. Adding a second policy engine below SLURM would create two
+authorities with no protocol between them, which is the failure the next axis
+describes.
 
 </details>
 
 ## Device Scheduler Control
 
+How accepted work is ordered before it reaches the QPU, and what a site can say
+about that ordering. This is the axis where the absence has the clearest
+operational consequence, because ordering is being decided twice.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+QRMI submits; it does not order. `task_start` takes a payload and returns a
+task id, with no priority, deadline, weight, or queue selection anywhere in the
+trait.
+
+The one ordering-adjacent construct is IQM-specific: `Payload::IQMServer`
+carries a `use_timeslot` boolean, passed through to the provider's job
+submission. It selects whether the job runs inside a reserved timeslot — a
+provider-side reservation concept — rather than expressing a relative ordering
+among the caller's own jobs. It is also, being part of the payload, typed by
+resource and unavailable to any other backend.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI has no scheduling control. The complete job parameter set is
+`QDMI_JOB_PARAMETER_PROGRAM`, `_PROGRAMFORMAT`, `_SHOTSNUM`, and five `CUSTOM`
+slots. There is no priority, no deadline, no ordering hint, and no queue
+selection.
+
+`QDMI_job_cancel` withdraws a submitted job, which is the only influence a
+caller has over what the device does next, and it is subtractive.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+**Work is ordered twice, by two schedulers that cannot talk to each other.** A
+site scheduler admits and orders jobs according to its own policy — fair share,
+priority, backfill, reservations. Those jobs then submit to the device, whose
+provider-side queue orders them again according to policy the site did not set
+and cannot see. Neither interface carries the first decision into the second.
+
+The consequence is not subtle. Two jobs the site deliberately ordered may reach
+the device in that order and execute in the opposite one. A high-priority job
+has no way to say so. A reservation the site granted means nothing at the
+device. And because provider timing is discarded by both interfaces (Telemetry),
+the site cannot even observe after the fact that its ordering was not honoured
+— it sees total wall time and cannot separate queue from execution.
+
+This is the sharpest example in this document of the two-layer problem the
+Interface Role axis describes. Ordering is genuinely a resource-manager
+concern, so it is reasonable that QDMI, a device contract, has no view on it.
+But it is equally true that a resource manager cannot do its job if its
+decisions are silently re-made below it, and neither interface provides the
+channel that would let it.
+
+**For a common spec.** Submission needs to carry scheduling intent — at
+minimum a priority or ordering key and a deadline or expiry, with defined
+behaviour when the provider cannot honour them, including saying so rather than
+silently reordering. Where a site holds a reservation, submission needs to
+reference it, which `use_timeslot` gestures at for one backend and one provider
+concept. And the provider's own queue position and expected wait need to be
+observable, so a scheduler can detect divergence between the order it chose and
+the order it got. Without that channel, quantum resources cannot be scheduled
+by an HPC site in any meaningful sense — they can only be submitted to.
 
 </details>
 
@@ -1331,18 +1442,74 @@ defined injection contract that supports both environment-based
 
 ## Control-Plane Authorization
 
+How protected service-control calls are authorized, separately from a user's
+right to execute work. The distinction matters where one credential lets a user
+run a circuit and another lets an operator change policy or inject credentials.
+
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
+
+There is one credential and one privilege level. A resource authenticates to
+the provider with a bearer token read from `{backend}_QRMI_IQM_ISA_TOKEN` or
+its per-backend equivalent, and every call on the trait uses it. No call is
+distinguished as privileged, because no call changes site policy — as the
+previous two axes record, there is no policy to change.
+
+The genuinely privileged operation in a QRMI deployment happens outside QRMI.
+The SPANK plugin runs in the SLURM prologue, as root, and injects credentials
+into the job environment. Whether a user may reach a device is decided there,
+by the resource manager, and QRMI's role begins after that decision with a
+token it does not question.
 
 </details>
 
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
+QDMI carries a richer identity vocabulary and the same single privilege level.
+Session parameters include `TOKEN`, `USERNAME`, `PASSWORD`, `AUTHFILE`,
+`AUTHURL` and `PROJECTID`, so a session can be established several ways and can
+name a project for the provider's accounting.
+
+`QDMI_ERROR_PERMISSIONDENIED` exists among the error codes, which implies an
+authorization model — but there are no control-plane calls in either header for
+it to protect. In practice it reports the provider refusing a device operation,
+not an operator being denied a privileged one.
+
 </details>
 
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
+
+Neither interface separates user execution rights from privileged operations,
+and today neither needs to, because neither has a privileged operation to
+protect. The absence is consistent rather than dangerous: there is no policy
+API, no configuration call, and no credential-injection entry point, so a
+single device-facing credential is sufficient for everything each interface
+actually does.
+
+That consistency is worth stating because it is a constraint on how these
+interfaces can grow. The moment either gains a control-plane call — set a
+limit, change a queue policy, register a device, inject a credential — a second
+authorization axis becomes mandatory, and neither has the vocabulary for it.
+QDMI is marginally better placed, having an identity model and a
+`PERMISSIONDENIED` code already; QRMI would be starting from a token read out
+of an environment variable.
+
+The deployment already has a control plane, and it is the site's: SLURM decides
+who may reach which device, and its prologue injects the credential as root.
+That is a real separation of privilege — the user never holds the operator's
+rights — and it works precisely because it sits outside both interfaces.
+
+**For a common spec.** If a specification stays at the device-and-resource
+level and leaves policy to the site, one device-facing credential remains
+adequate and this axis stays small. If it grows any operator-facing surface —
+which the previous two axes argue against, but which is a live option — then
+authorization must be split at the same time and not retrofitted: protected
+calls named explicitly, a privilege distinct from execution rights, and a
+defined answer when an unprivileged caller attempts one. The failure mode to
+avoid is the one visible under Admission, where a call exists, returns success,
+and does not do what its name says.
 
 </details>
 
