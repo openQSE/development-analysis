@@ -53,6 +53,11 @@ qubits, 30 edges, in agreement), and one canonical circuit executed through
 each returned identical counts in the same normalized result record. Axis
 entries below that cite hardware observations derive from those runs.
 
+**Resolution:** the conclusions this comparison supports are collected in the
+companion document [`qrmi-qdmi-resolution.md`](./qrmi-qdmi-resolution.md).
+This document records what was observed. The resolution records what should
+follow from it.
+
 ## Comparison Axes
 
 This table defines the comparison axes. It describes what each axis means and
