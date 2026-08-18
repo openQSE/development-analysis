@@ -1246,6 +1246,21 @@ There is no queue-state property, and the job object exposes no submission,
 queue, or execution timestamps — so, as on the QRMI side, queue time and
 execution time are not separable by the caller.
 
+Queue position is a narrower case, and the more instructive one. The IQM job
+submission response carries a `queue_position` field, and QDMI-on-IQM does read
+it. In `IQM_QDMI_device_job_submit_circuit()` (and its calibration counterpart)
+the value is parsed and appended to an INFO log message. It is not stored on the
+job and it is not exposed as a property. The device job properties that
+implementation serves are `ID`, `PROGRAMFORMAT`, `PROGRAM`, `SHOTSNUM`, and five
+`CUSTOM` slots. So the provider supplies the caller's position in the queue, the
+device library prints it, and no caller above the interface can retrieve it.
+
+Two qualifications. The parse is guarded by a `contains("queue_position")`
+check, so the field is optional from the implementation's point of view, and it
+has not yet been confirmed populated on the ORNL device. And the value is a
+one-time report at submission rather than a queryable property, so even if it
+were exposed it would not by itself answer how deep the queue is now.
+
 Cost of observing. The IQM device library fetches during session init, so the
 cost is paid when the device is opened; property queries afterwards are local
 reads. Measured on the same device and path: 3376.8 ms median cold (5 samples,
@@ -1271,9 +1286,11 @@ interface decides what to keep.
 **What is exposed.** Both interfaces report device-level state — reachability
 and quality data on the QRMI side, a typed device status and calibration
 signals on the QDMI side — and both report job state. Neither exposes queue
-depth, queue position, device load, or any provider timestamp. A scheduler
-cannot ask either interface how busy the device is, or learn afterwards how
-much of a job's elapsed time was queueing rather than execution.
+depth, device load, or any provider timestamp to a caller, and neither exposes
+queue position either, though as recorded above QDMI-on-IQM does receive it and
+log it. A scheduler cannot ask either interface how busy the device is, or
+learn afterwards how much of a job's elapsed time was queueing rather than
+execution.
 
 **That gap is not the provider's.** The native client reads the IQM job
 timeline and reports the phases directly: queue wait, validation, compilation,
@@ -1282,6 +1299,12 @@ ms of queue wait and 107.3 ms of execution on a circuit whose client-side
 elapsed time was several seconds. The same device, through either interface,
 reports none of it.
 
+Queue position is the same story in miniature, and it is worth stating
+separately because it is not a case of an interface failing to ask. The
+provider volunteers the value in the submission response. QDMI-on-IQM receives
+it, formats it into a log line, and keeps no record of it on the job. The
+information travels all the way to the library and stops there.
+
 So queue-versus-execution is not information that has to be invented for a
 common spec, nor obtained by instrumenting callers. It exists at the provider
 and is discarded in the layer above. QRMI's `task_result` carries measurement
@@ -1289,6 +1312,13 @@ JSON and drops the timeline that accompanied it; QDMI's job object exposes no
 timestamp property at all. That is a stronger and more actionable finding than
 a symmetric absence: the requirement is to preserve what the provider already
 sends, not to construct something new.
+
+It also divides the work. Carrying scheduling intent *down* to the provider
+depends on the provider accepting it, so priority, deadlines, and portable
+reservation references need vendor cooperation. Getting device and job state
+back *up* mostly does not, because the data is already arriving and is being
+dropped by the layer above. The second half of that division is available to
+implementers today.
 
 It also bounds what the interfaces can support. Any scheduler decision that
 depends on distinguishing a busy device from a slow interface — backpressure,
