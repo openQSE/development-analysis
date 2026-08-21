@@ -23,9 +23,10 @@ Unless an entry says otherwise, observations were made against:
 
 | Component | Version | Role |
 |---|---|---|
-| `qrmi` | 0.17.2 | QRMI interface and its IQM resource implementation |
-| `iqm-qdmi` | 1.2.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
-| `mqt-core` | 3.7.0 | QDMI headers and the FoMaC layer the Python caller uses |
+| `qrmi` | 0.23.1 | QRMI interface and its IQM resource implementation |
+| `iqm-qdmi` | 1.3.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
+| `mqt-core` | 3.9.0 | QDMI client, headers, and the FoMaC layer the Python caller uses |
+| `QDMI` | 1.3.3 client-side, 1.3.2 device-side | the specification each side was built against. See below, the difference is load-bearing |
 | `iqm-client` | 34.0.1 | IQM Server client used by the QFw drivers |
 | `iqm-station-control-client` | 12.1.1 | IQM station-control models |
 | `iqm-pulse` | 13.0.1 | IQM circuit objects produced by transcoding |
@@ -33,6 +34,23 @@ Unless an entry says otherwise, observations were made against:
 
 Hardware observations are against the ORNL IQM 20-qubit device, reached through
 the QFw shim (`openQSE/QFw`, `services/svc_lib_qpm`).
+
+**These versions replace an earlier baseline of `qrmi` 0.17.2, `iqm-qdmi` 1.2.0,
+and `mqt-core` 3.7.0, and the axes below have been rechecked against them.**
+Most findings survived. Where one did not, the axis says what changed rather
+than quietly presenting the new state as though it had always held. Three
+findings moved materially: the calibration set identity under Device
+Introspection and Calibration And Quality Data, queue position under Telemetry,
+and the not-supported answer under Extensibility And Versioning.
+
+The two QDMI rows are deliberately separate. The client side of this
+comparison, MQT Core 3.9.0, is built against QDMI 1.3.3. The device side,
+QDMI-on-IQM 1.3.0, is built against QDMI 1.3.2. One patch release apart, and
+that gap is directly observable from the caller. It is discussed under
+Extensibility And Versioning rather than treated as an artifact of the test
+setup, because independently released device libraries lagging the client is
+the normal condition for the ABI model QDMI is built on, not an accident of
+this measurement.
 
 On source citations. Where this document cites QDMI-on-IQM source it means the
 corresponding upstream tag, not any local working tree — `iqm-qdmi` ships as a
@@ -43,8 +61,14 @@ Citations are anchored by symbol or function name rather than by line number
 wherever the file is one that moves. Line numbers were tried first and did not
 survive: every QDMI-on-IQM line reference in Calibration And Quality Data had
 drifted by the time it was rechecked at 1.2.0, and the QFw ones had been moved
-by later commits to those same files. The `qrmi` references retain line numbers
-because they were verified against the pinned 0.17.2 tag, which is not moving.
+by later commits to those same files.
+
+The remaining `qrmi` line-number citations kept their numbers on the argument
+that the pinned 0.17.2 tag was not moving. The pin moved. Those citations are
+now anchored to 0.17.2 as a historical reference and have drifted against
+0.23.1, which is the version this document otherwise describes. They are marked
+where they appear. The lesson generalizes past this document: a citation whose
+validity rests on a pin is only as stable as the decision not to upgrade.
 
 **Status (2026-07-28):** the comparison now has live-hardware backing. Both
 interfaces ran against the ORNL IQM 20-qubit system through the QFw shim:
@@ -240,7 +264,7 @@ device.
 
 Capability is carried by the resource *type* rather than advertised by the
 resource. `ResourceType` enumerates seven backends (`IQMServer`,
-`IBMDirectAccess`, `IBMQiskitRuntimeService`, `IBMQuantumSystem`,
+`IBMQuantumComputeService`, `IBMQiskitRuntimeService`, `IBMQuantumSystem`,
 `AliceBobFelis`, `PasqalCloud`, `PasqalLocal`) and `Payload` four variants
 (`IQMServer`, `QiskitPrimitive`, `AliceBobFelis`, `PasqalCloud`). Knowing the
 type tells the caller which payload to build, but that mapping is knowledge the
@@ -255,11 +279,31 @@ is found out by making it.
 <details>
 <summary><strong>QDMI Behavior</strong></summary>
 
-Discovery is a query against the session. `QDMI_SESSION_PROPERTY_DEVICES`
-enumerates the devices a session can see, surfaced in MQT Core's FoMaC as
+Discovery has two forms, and the second one is new since the previous baseline.
+
+The original form is a query against the session. `QDMI_SESSION_PROPERTY_DEVICES`
+enumerates the devices a session can see, surfaced in MQT Core as
 `Session.get_devices()`. Devices reach a session through the driver's device
-libraries; in the QFw shim the IQM library is loaded explicitly by path with
-`add_dynamic_device_library`, which returns the device directly.
+libraries.
+
+The second form is a registry. MQT Core 3.8 replaced the runtime loader
+(`add_dynamic_device_library`, which took a library path and returned an open
+device in one step) with registration by a stable device ID followed by an
+explicit open. A caller registers a `DeviceDefinition` naming an ID, a library
+path, and a symbol prefix. Registration validates and stores that definition
+and loads no native code. `open_device(id)` then creates a fresh session.
+MQT Core 3.9 added `registered_device_ids()`, which returns the enabled IDs
+without loading any device library, and ships bundled device models under
+stable IDs, so a fresh install already enumerates `mqt.ddsim.default`,
+`mqt.sc.iqm.garnet`, `mqt.sc.iqm.emerald`, and others. QDMI-on-IQM publishes
+its own ID, `iqm.default`, for callers to register the packaged library under.
+
+The distinction matters for this axis. The old model could only tell a caller
+what was reachable after it had loaded and initialized native code for each
+candidate. The new one separates the catalogue from the loading, so a caller
+can enumerate what a host is configured to offer, and pay the cost of opening
+only the one it picks. That is closer to what a resource manager needs than
+what the session enumeration alone provided.
 
 Capability is advertised by the device and queried per property.
 `Device.supported_program_formats()` returns the formats that device accepts,
@@ -308,12 +352,28 @@ the *device* supports rather than what the *interface path* supports. The map
 is therefore maintained by hand and can drift from the libraries it describes —
 which it did, silently, until a routing assertion failed.
 
+**Part of what this axis asked for has since been built.** The recommendation
+below was written against the session-enumeration model. MQT Core 3.8 and 3.9
+then split the catalogue from the loading, which supplies most of the
+enumeration half: a registry of stable IDs, readable without loading native
+code, populated from configuration files a site controls. That is the scoping
+the recommendation asks for, arriving from the QDMI side. What it still does
+not supply is capability. An ID in the registry says a device exists and names
+the library that would serve it. It does not say what that device accepts.
+Answering that still means opening the device, which means loading the library
+and initializing a session, which for a hardware backend means contacting the
+provider.
+
 **For a common spec.** Discovery should be a call, with the resource manager
 able to scope its results, so the same API serves both the constrained batch
 case and the exploratory client case. Capability advertisement should be
 queryable per resource rather than implied by a type constant, should cover
 accepted program formats explicitly, and should use a typed
 not-supported answer so that unsupported and unavailable are distinguishable.
+The registry development adds one requirement that was not visible before:
+enumeration and capability should be answerable at the same cost. A catalogue
+that is cheap to read but tells a caller nothing about suitability moves the
+expense rather than removing it.
 The test is whether a portable caller can select a device and construct a valid
 request without holding out-of-band knowledge about the backend — which today
 it cannot do through either interface alone.
@@ -575,6 +635,28 @@ observable, so a scheduler can detect divergence between the order it chose and
 the order it got. Without that channel, quantum resources cannot be scheduled
 by an HPC site in any meaningful sense — they can only be submitted to.
 
+**One of those three requirements is now partly met, which usefully separates
+the other two.** The observability half moved. QDMI 1.3.3 named
+`QDMI_JOB_PROPERTY_QUEUEPOSITION` and `QDMI_DEVICE_PROPERTY_QUEUELENGTH`, MQT
+Core 3.9 binds both, and on the QRMI side the provider's job timeline was
+already reaching the caller through `task_logs()`, if only as formatted text
+(see Telemetry). The device implementation has not caught up on the QDMI side
+and the QRMI side returns prose rather than data, so nothing is usable today.
+But the specification question is settled for observability: it is agreed that
+a caller should be able to see queue state, and the remaining work is
+implementation.
+
+Carrying intent **down** has not moved at all. There is still no priority, no
+deadline, no ordering key, and no way for a site to tell a provider that its
+reservation means something. That asymmetry is worth stating plainly, because
+the two halves have different politics. Reporting queue state costs a provider
+nothing and reveals little. Honouring an external ordering decision means
+ceding control of the provider's own queue to a customer, which is a commercial
+question before it is a technical one. Expect the observability half to arrive
+and the intent half to stall, and note that observability alone converts the
+problem from invisible to merely unfixable: the site will be able to measure
+that its ordering was discarded, and still have no way to prevent it.
+
 </details>
 
 ## Runtime Submission
@@ -682,6 +764,31 @@ not a run request. `IQM_QDMI_device_job_submit_circuit()` wraps it -- it builds
 the calibration set id comes from the initialized session. In the QFw shim the
 QDMI driver serializes just the transcoded circuit and passes shots to
 `submit_job(...)`; the run-request envelope is assembled by the device library.
+
+Three changes to the submission surface since the earlier baseline, all in the
+direction of saying what was previously implied.
+
+Text and binary payloads are now distinguished. MQT Core 3.8 split `submit_job`
+into a string form and an exact-bytes form, and the accessors follow, with
+`Job.program` for text and `Job.program_bytes` for the submitted bytes. The
+motivating case is QIR, where the `*_STRING` formats are text and the `*_MODULE`
+formats are LLVM bitcode. Passing bitcode through a string API had been working
+by accident of encoding. `IQM_JSON` is text and is unaffected.
+
+Calibration runs got their own entry point. `submit_job` had rejected the
+`CALIBRATION` and `BATCH_JOB` formats together, which left an implementation
+able to report through `needs_calibration()` that a device needed calibrating
+and no way to ask for one. `submit_calibration_job()` now exists, takes an
+optional payload, and takes no shot count, since a calibration run executes no
+circuit.
+
+Batch submission was removed rather than left unimplemented. A batch job's
+program is a list of job handles, not a byte payload, so it never fit the
+signature. Passing `ProgramFormat.BATCH_JOB` to `submit_job` now raises. This
+is worth noting as a positive example for the Error Model and Extensibility
+axes: an operation that could not be expressed in the interface was withdrawn
+and made to fail loudly, instead of being left as a shape a caller could
+construct and then discover was meaningless.
 
 </details>
 
@@ -883,16 +990,32 @@ answers it with the IQM job id (`QDMI-on-IQM/src/iqm_device.cpp`,
 `Job.id` property. Provider-job correlation is therefore supported on this
 path.
 
-Calibration identity is not. No job or device property returns the calibration
-set a job ran under — the same accessor gap already noted for calibration
-identity under Device Introspection. The run-request envelope was assembled
-inside the device implementation (see Runtime Submission), so the caller never
-held the submission document either, and no provenance of what was actually
-submitted is retrievable from the job.
+Calibration identity is reachable, with a caveat, and this is a correction to
+the earlier baseline. No **job** property returns the calibration set a job ran
+under. The **device** does expose it, in the `CUSTOM1` slot, and MQT Core 3.8's
+typed custom-property query made it readable from Python. See Device
+Introspection for the full correction. The caveat matters for this axis
+specifically: the value read from the device is the set that is active *now*,
+not the set a given job ran under. For a job that completes while a calibration
+rotates, those are different, and nothing in the job record pins which one
+applied. Correlating a result with its calibration therefore still depends on
+the caller reading the device property close enough in time to the run, which is
+a convention rather than a guarantee.
 
-Timing is also absent. The FoMaC job object exposes no submission, queue, or
-execution timestamps, so any duration on this path is measured by the caller
-around its own calls rather than reported by the provider.
+The run-request envelope was assembled inside the device implementation (see
+Runtime Submission), so the caller never held the submission document either,
+and no provenance of what was actually submitted is retrievable from the job.
+
+Job retrieval was added in MQT Core 3.9: a job can now be recovered by its
+provider ID through `Device.retrieve_job_by_id()`. Before that a `Job` existed
+only as the object returned by submission, so a process that submitted and then
+exited had no way back to the work it started. For a batch system where
+submission and result collection are different processes, and possibly different
+SLURM steps, that gap was structural rather than cosmetic.
+
+Timing is absent. The job object exposes no submission or execution timestamps.
+Queue position is a partial exception as of QDMI 1.3.3, which named the property
+that QDMI-on-IQM 1.3.0 does not yet serve. See Telemetry.
 
 </details>
 
@@ -978,11 +1101,34 @@ assembled from three IQM Server REST calls: the dynamic quantum architecture
 set. The document is raw IQM data — the field names and structure are
 provider-specific, and the consumer parses the IQM shapes directly.
 
-On a live IQM server (the ORNL q20), the assembled document contained exactly
-those three components and no static architecture: the qubit set `target()`
-reports is the dynamic — currently calibrated — one. A consumer that needs the
-chip's static topology independent of the active calibration set (a separate
-endpoint in the native IQM API) does not get it through this call.
+**This changed at QRMI 0.22.0.** The earlier baseline recorded that the
+assembled document contained exactly those three components and no static
+architecture, so the only qubit set `target()` reported was the dynamic,
+currently calibrated one, and a consumer wanting the chip's static topology had
+to go elsewhere. 0.22.0 added a fourth component,
+`static_quantum_architecture`, taken from the quantum-computer-level
+`static-quantum-architectures` artifact rather than from anything bound to a
+calibration set. On the ORNL q20 it carries four fields: the full 20-qubit set,
+the connectivity, an empty computational-resonator list, and the DUT label
+`M194_F0W1388_P08_Q12`, which is the chip identity none of the other three
+components supply.
+
+It is best-effort rather than guaranteed. QRMI's own implementation notes that
+the available artifacts depend on the quantum computer's Station Control
+version, so a 404 for this one specifically is normal and is represented as
+`null`, while the other three components are required and a failure in any of
+them fails the whole call. A consumer therefore has to treat the static
+architecture as optional in a way it does not have to treat the dynamic one.
+
+The shape is worth recording because it caused a real break. The field is a
+**list** of architectures, one per DUT, not a single object, and consumers
+written against the previously-absent field assumed an object. In QFw the
+normalizer called `.get()` on what it was handed and the first introspection
+call after the upgrade failed with `AttributeError: 'list' object has no
+attribute 'get'`. This is the Data Normalization hazard in its purest form: an
+optional field that has never been populated is untested code on the consumer
+side, and the provider filling it in is indistinguishable, from the consumer's
+point of view, from a breaking change.
 
 `target()` is not reservation-bound; it does not require `acquire()` and reads
 the current data with only a valid endpoint and token. There is no separate
@@ -995,7 +1141,9 @@ introspection are the parsing of the raw payload.
 <summary><strong>QDMI Behavior</strong></summary>
 
 QDMI exposes introspection as a typed, vendor-neutral query interface. Through
-MQT Core's FoMaC (`mqt.core.fomac`), a `Device` provides typed accessors:
+MQT Core's FoMaC layer, bound in Python as `mqt.core.qdmi` since MQT Core 3.9
+(the former `mqt.core.fomac` module remains as a deprecated alias through the
+v3 series), a `Device` provides typed accessors:
 `name()`, `version()`, `status()`, `qubits_num()`, `supported_program_formats()`,
 `needs_calibration()`, `duration_unit()`, `coupling_map()`, `sites()`, and
 `operations()`. A `Site` exposes `name()` (the device's real qubit label, e.g.
@@ -1007,6 +1155,13 @@ The values are the device's real labels and metrics, not a provider-specific
 document. Every query is session-based: the session must be initialized before
 any property can be read.
 
+MQT Core 3.8 added a typed query for the vendor custom slots,
+`query_custom_property(property, value_type)`, which returns the value coerced
+to the requested Python type. This is what makes the numbered `CUSTOM` slots
+reachable from Python at all. Before it, the binding exposed each accessor
+explicitly and had no generic property call, so anything a vendor put in a
+custom slot was visible to a C++ caller and invisible to a Python one.
+
 </details>
 
 <details>
@@ -1016,21 +1171,46 @@ QRMI presents introspection as one raw provider document behind a single call;
 QDMI presents it as a set of typed, vendor-neutral properties. The QRMI form
 preserves everything the provider sends — including calibration and quality
 identity — at the cost of provider-specific parsing. The QDMI form is portable
-and directly consumable, but exposes what its neutral property set covers: the
-per-qubit and per-gate metric values are present, while the provider's
-calibration-set identity is not currently reachable through the FoMaC Python
-accessors.
+and directly consumable, but exposes what its neutral property set covers.
+
+**The calibration-set identity finding is corrected.** The earlier baseline
+recorded that the provider's calibration-set identity was not reachable through
+the QDMI path. That was wrong, and it is worth being precise about how, because
+the mistake is instructive. QDMI-on-IQM does publish the active calibration set
+ID, in the device's `CUSTOM1` slot, and has since at least 1.2.0. The source
+carries an explicit comment saying so. What was missing was purely the Python
+side: MQT Core bound each accessor by hand and had no generic property query, so
+a value sitting in a custom slot could not be read from Python. MQT Core 3.8
+added `query_custom_property` and the value became reachable.
+
+Measured on the ORNL q20 at the current versions, the QDMI path returns
+`05ce3ca0-72af-4a1b-acfb-99233fc35e9a`, byte-identical to the
+`calibration_set_id` QRMI reports inside `dynamic_quantum_architecture`. The two
+interfaces agree on calibration identity as well as on topology.
+
+The corrected finding is narrower and more useful than the one it replaces. It
+is not that the neutral model cannot carry provider identity. It is that the
+neutral model carries it in a **numbered, unnamed slot**, so a portable caller
+cannot read it. Reading `CUSTOM1` requires knowing that this vendor put the
+calibration set ID there, which is out-of-band knowledge of exactly the kind a
+neutral interface exists to remove. A second vendor may use `CUSTOM1` for
+something else and be equally conformant. See Extensibility And Versioning,
+where this is the concrete case the custom-slot argument was predicting.
 
 A concrete consequence in QFw: `get_device_info` and `get_coupling_graph` are
 served by both interfaces, but `get_backend_info` and `get_dynamic_backend_info`
-are served only by QRMI, because their shape carries raw IQM architecture data
-(static architecture, active qubits, calibration-set id) that the QDMI-neutral
-property model does not expose in that form.
+are served only by QRMI, because their shape is the raw IQM architecture
+document rather than a normalized record. That split is now about payload shape
+alone. The two pieces of content originally cited as QDMI-side gaps have both
+closed from opposite directions: QRMI gained the static architecture at 0.22.0,
+and QDMI's calibration-set id became readable at MQT Core 3.8.
 
 For a common spec: a typed, neutral property model (QDMI-like) is the more
-portable basis, provided it also reserves a defined place for provider identity
-and provenance (such as the calibration-set id) that the raw model (QRMI)
-already carries.
+portable basis, provided it gives provider identity and provenance a **named**
+place. The calibration set ID is the test case. It is not vendor-specific in
+any meaningful sense, every provider that calibrates has one, and it is the
+single field that makes a measured value interpretable later. A model that
+leaves it to a numbered vendor slot has not specified it.
 
 </details>
 
@@ -1111,8 +1291,9 @@ them through FoMaC.
 
 **QFw Entry Point**
 
-- QFw opens the IQM QDMI shared library through MQT Core's FoMaC loader
-  (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py`, `_device()`).
+- QFw registers the IQM QDMI shared library under its stable device ID and
+  opens it (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py`, `_device()`).
+  This replaced a one-step runtime loader in MQT Core 3.8. See Device Discovery.
 - `get_calibration_snapshot()` calls
   `fomac_normalize.extract_calibration(self._device())`
   (`QFw/services/svc_lib_qpm/drivers/qdmi_driver.py`, `get_calibration_snapshot()`).
@@ -1164,6 +1345,14 @@ them through FoMaC.
 The QDMI path therefore provides portable calibration properties. It does not
 provide the raw IQM calibration or quality-metric observation sets to Python.
 
+It does provide calibration **identity**, which the earlier baseline recorded as
+missing. The active calibration set ID is exposed in the device's `CUSTOM1` slot
+and has been since at least 1.2.0. What changed is the Python side: MQT Core 3.8
+added a typed custom-property query, and the value became readable. Measured on
+the q20, it matches the `calibration_set_id` QRMI reports. So the split on this
+axis is between identity and bulk. Both interfaces now say *which* calibration
+is active. Only QRMI hands over the observation sets that calibration contains.
+
 </details>
 
 <details>
@@ -1197,6 +1386,16 @@ based on mapped metrics. Workflows that need full IQM calibration analytics
 must use the QRMI path, the native IQM path, or a QDMI extension that exposes
 raw calibration and quality-metric observation sets.
 
+The identity correction narrows what a specification has to argue about here.
+Carrying the full provider observation set through a neutral interface is a real
+design question with a defensible answer either way, since the payload is large,
+provider-shaped, and useful to few callers. Carrying the identifier of the
+calibration a measurement came from is not that kind of question. It is one
+string, every calibrating provider has it, and without it the metrics on the
+portable path cannot be compared across time or matched to a result. Today both
+libraries supply it, one in a raw document and one in an unnamed vendor slot,
+and neither in a place a portable caller can rely on by name.
+
 </details>
 
 ## Telemetry
@@ -1221,8 +1420,26 @@ state is `task_status()`, with `task_logs()` for provider logs.
 
 There is no queue-state call. In the QFw result record the metadata block
 carries a `queue_position` field, which the IQM path leaves null. `task_result`
-returns measurement JSON and no timestamps, so no provider-side timing reaches
-the caller (see Job Lifecycle And Results).
+returns measurement JSON and no timestamps.
+
+**One correction to the earlier reading of this axis.** It concluded from
+`task_result` that no provider-side timing reaches the caller. That is true of
+`task_result` and false of the interface. `task_logs()` fetches the IQM job with
+its timeline included and returns the provider's per-event record, each entry
+carrying a timestamp, a source, and a status. The provider's own account of when
+the job moved between states does reach the caller.
+
+It arrives as a preformatted string. The implementation walks the timeline and
+writes lines into a `String` with fixed-width padding, then does the same for
+the job's messages, and returns the assembled text. A scheduler wanting to know
+how much of a job's elapsed time was queueing has the data, and has to recover
+it by parsing prose that QRMI generated from structured input it already held.
+
+That is a different failure from the one the axis originally recorded, and a
+more tractable one. The data is not missing. It has been flattened into a
+display format at the interface boundary. This behavior predates the current
+version and was present at 0.17.2, so it is a gap in the earlier reading rather
+than a change in the library.
 
 Cost of observing. `target()` issues three IQM REST calls and the shim driver
 caches the parsed document per driver instance, so the cost is paid once per
@@ -1261,6 +1478,21 @@ has not yet been confirmed populated on the ORNL device. And the value is a
 one-time report at submission rather than a queryable property, so even if it
 were exposed it would not by itself answer how deep the queue is now.
 
+**Half of that has since been fixed, and the half that has not is now precisely
+located.** QDMI 1.3.3 added two named properties for exactly this:
+`QDMI_JOB_PROPERTY_QUEUEPOSITION` and `QDMI_DEVICE_PROPERTY_QUEUELENGTH`.
+Neither existed in 1.3.2. MQT Core 3.9 binds both, as `Job.queue_position` and
+`Device.queue_length`, each returning an optional value. So the specification
+now has a defined place to put the number, and the client layer can carry it.
+
+QDMI-on-IQM 1.3.0 still does not. Its job property handler serves `ID`,
+`PROGRAMFORMAT`, `PROGRAM`, `SHOTSNUM`, and the five `CUSTOM` slots, then
+returns not-supported. The submission response is still parsed only into a log
+line. The finding therefore sharpens rather than dissolves: the value the
+provider sends is now one stored field and one property case away from reaching
+a caller, and the remaining work sits entirely in the device implementation
+rather than in the specification.
+
 Cost of observing. The IQM device library fetches during session init, so the
 cost is paid when the device is opened; property queries afterwards are local
 reads. Measured on the same device and path: 3376.8 ms median cold (5 samples,
@@ -1286,11 +1518,31 @@ interface decides what to keep.
 **What is exposed.** Both interfaces report device-level state — reachability
 and quality data on the QRMI side, a typed device status and calibration
 signals on the QDMI side — and both report job state. Neither exposes queue
-depth, device load, or any provider timestamp to a caller, and neither exposes
-queue position either, though as recorded above QDMI-on-IQM does receive it and
-log it. A scheduler cannot ask either interface how busy the device is, or
-learn afterwards how much of a job's elapsed time was queueing rather than
-execution.
+depth or device load to a caller in usable form. A scheduler still cannot ask
+either interface how busy the device is.
+
+**The provider timestamp finding has to be restated, and it gets more useful in
+the restating.** The earlier version said neither interface exposes any provider
+timestamp. Rechecking found that both of them receive the data and lose it in
+different ways, which is a better finding than absence.
+
+| | What the provider sends | Where it stops |
+|---|---|---|
+| QRMI | Job timeline, one entry per state transition with timestamp, source, and status | Reaches the caller, but flattened by `task_logs()` into a preformatted display string |
+| QDMI-on-IQM | Queue position in the submission response | Parsed, appended to an INFO log line, never stored on the job |
+
+Neither loss is architectural. QRMI already holds the timeline as structured
+data and chooses to render it. QDMI-on-IQM already parses the integer and
+chooses to log it, and since QDMI 1.3.3 there is a named property waiting for
+it. In both cases the value crossed the network, entered the library, and was
+discarded above the wire and below the caller.
+
+That divides the remaining work in a way this axis did not previously make
+explicit. Pushing scheduling intent **down** to the provider needs the provider
+to accept it, which needs vendor cooperation and probably a specification.
+Getting device and job state back **up** mostly does not. The data is already
+arriving. It is being thrown away by code on this side of the boundary, and
+for one of the two cases the place to put it now exists.
 
 **That gap is not the provider's.** The native client reads the IQM job
 timeline and reports the phases directly: queue wait, validation, compilation,
@@ -1592,10 +1844,37 @@ adapters can populate different fields of the same record — for calibration, t
 QRMI adapter fills the IQM observation-set identity (set ids, counts,
 timestamps) while the QDMI adapter fills measured T1/T2 and gate fidelity.
 
+**The thick source is the fragile one, and the recheck demonstrated it.** The
+two adapters are not equally exposed to provider change, and the upgrade made
+the asymmetry concrete. QRMI 0.22.0 added `static_quantum_architecture` to the
+`target()` document. That is an additive change by any normal reading, and it
+broke the QRMI adapter. The field had never been populated, the adapter's
+handling for it had therefore never executed, and the new value arrived as a
+list where the code expected an object. The first introspection call after the
+upgrade raised `AttributeError: 'list' object has no attribute 'get'`.
+
+Nothing equivalent could happen on the QDMI side within a single interface
+version, because a new capability there is a new property with a declared type,
+which an existing caller does not ask for and so never receives. The thin
+source's adapter breaks when the *interface* changes. The thick source's adapter
+breaks when the *provider payload* changes, which happens more often, is not
+governed by the interface's own versioning, and does not announce itself.
+
+Two lessons for a specification, neither about schemas. First, an optional field
+that a source has never populated is untested code in every consumer, and the
+day the source starts sending it is indistinguishable, downstream, from a
+breaking change. Optional-and-absent and optional-and-present should be
+exercised before they are relied on. Second, if a normalized record is going to
+carry a passthrough of provider-native data, the interface should version that
+passthrough, or consumers will keep discovering its shape by crashing.
+
 For a common spec: the normalized record schema is the contract, and the
 normalizer is a per-source adapter. A single schema with clearly optional,
 provider-specific fields lets a thick source and a thin source converge on one
-record without forcing either to invent data it does not have.
+record without forcing either to invent data it does not have. The optional
+fields are where the cost lands, so the specification should say what a
+consumer may assume about a field it has never seen populated, which today is
+nothing.
 
 </details>
 
@@ -1813,13 +2092,18 @@ implementation does not provide returns `QDMI_ERROR_NOTSUPPORTED`, one of
 eleven typed codes that also include `NOTIMPLEMENTED`, `NOTFOUND`,
 `PERMISSIONDENIED` and `LIBNOTFOUND`. A caller can probe and receive a defined
 answer, which is what makes a partial implementation expressible rather than
-something to be worked around.
+something to be worked around. **In the version-skew case this degrades, and
+that is measured below.**
 
 Vendor-specific extension has reserved space: five `CUSTOM` slots in each
 property family — device, site, operation, job and session properties, and job
 parameters. QDMI-on-IQM uses them, passing the quantum-computer alias as a
-session parameter and exposing raw IQM device data through
-`QDMI_DEVICE_PROPERTY_CUSTOM1`.
+session parameter and exposing the active calibration set ID through
+`QDMI_DEVICE_PROPERTY_CUSTOM1`. (An earlier revision of this document described
+that slot as carrying raw IQM device data. It does not, and did not at 1.2.0
+either. The implementation comment above the line states plainly that the slot
+exposes the calibration set ID. The error came from reading a local branch that
+had added raw passthrough, and attributing it to the released library.)
 
 Version is discoverable at runtime through the device itself:
 `QDMI_DEVICE_PROPERTY_VERSION` for the device and
@@ -1850,20 +2134,70 @@ meaningless for a backend become no-ops rather than honest absences. The
 under Device Discovery are not three separate oversights — they are one design
 choice observed from three directions.
 
-**Reserved custom slots are extensibility without portability.** QDMI's five
-`CUSTOM` slots per family let a vendor expose anything without a spec change,
-which is genuinely useful and is how QDMI-on-IQM carries the IQM alias and its
-raw device data. But a custom slot means whatever its vendor decided, so
-portable code cannot use one, and two vendors will not agree on `CUSTOM1`.
-They are an escape hatch, and the more load they carry the less the neutral
-model is actually describing the device. Watching what accumulates in them is a
-good indicator of what the specification is missing.
+**Reserved custom slots are extensibility without portability, and there is now
+a concrete case.** QDMI's five `CUSTOM` slots per family let a vendor expose
+anything without a spec change, which is genuinely useful. But a custom slot
+means whatever its vendor decided, so portable code cannot use one, and two
+vendors will not agree on `CUSTOM1`. They are an escape hatch, and the more load
+they carry the less the neutral model is actually describing the device.
+
+This axis previously offered "watch what accumulates in them" as a heuristic for
+finding what the specification is missing. Applying it produces a specific
+answer. What accumulated in QDMI-on-IQM's `CUSTOM1` is the **calibration set
+ID**. That is not a vendor peculiarity. Every provider that calibrates has one,
+and it is the field that makes any measured value interpretable after the fact,
+because a fidelity without the calibration it came from cannot be compared to
+anything. It sits in a numbered slot because the specification has no named
+place for it. The heuristic worked, and the backlog it produced has one clear
+item on it.
+
+The reverse case is visible in the same window and confirms the mechanism.
+Queue position and queue length were also missing from the named model. QDMI
+1.3.3 added `QDMI_JOB_PROPERTY_QUEUEPOSITION` and
+`QDMI_DEVICE_PROPERTY_QUEUELENGTH` as named properties, without moving any
+function signature, and MQT Core bound them one minor release later. That is the
+promotion path working as designed: identify what vendors are carrying out of
+band, name it, and the ABI does not move.
+
+**The typed not-supported answer does not survive version skew, and this was
+measured.** The claim above is that a caller can probe an unknown implementation
+and receive a defined answer. Upgrading the client side to MQT Core 3.9, built
+against QDMI 1.3.3, while the device library remained QDMI-on-IQM 1.3.0, built
+against QDMI 1.3.2, produced a case where it does not.
+
+Asking the q20 for `Device.queue_length()` returns
+`QDMI_ERROR_INVALIDARGUMENT`, surfaced in Python as
+`ValueError: Querying QUEUE LENGTH: Invalid argument`. Not
+`QDMI_ERROR_NOTSUPPORTED`. The mechanism is straightforward once seen.
+`QDMI_DEVICE_PROPERTY_QUEUELENGTH` is new in 1.3.3, so it sorts above the
+`QDMI_DEVICE_PROPERTY_MAX` the device library was compiled against. That
+library's property handler rejects anything at or above its own `_MAX`, other
+than the `CUSTOM` slots it names explicitly, as an invalid argument before any
+per-property logic runs. From the caller's side two different situations now
+return the same code: passing a genuinely malformed property, and asking a
+slightly older library about a property it has never heard of.
+
+This is the exact case the ABI model exists to handle. A device library released
+by a vendor on its own schedule will routinely be older than the client asking
+it questions. One patch release of drift was enough to produce this. The problem
+is not that the older library lacks the feature, which is expected and fine. It
+is that `NOTSUPPORTED` means "I know this property and do not provide it" while
+the unknown-enum case falls through to a generic argument error, so a caller
+cannot distinguish "this device has no queue" from "this device predates the
+question" from "you passed garbage". A conformance requirement that unknown
+values in the reserved property range return `NOTSUPPORTED` rather than
+`INVALIDARGUMENT` would cost an implementation one comparison, and would make
+capability probing work across versions, which is the thing it is for.
 
 **Runtime version discovery is a real asymmetry.** QDMI lets a caller ask a
 just-loaded library which version it implements. QRMI has no equivalent,
 because the question does not arise when the vendor code ships in the same
 build — which is consistent, but means anything reusing QRMI's model with
-independently-released backends would have to add it.
+independently-released backends would have to add it. Version discovery is also
+the workaround for the finding above. A caller that cannot trust the error code
+has to ask each library its version and keep its own table of which properties
+exist in which release, which is precisely the out-of-band knowledge the typed
+error was supposed to make unnecessary.
 
 **For a common spec.** If the provider side is an ABI implemented by others —
 which the Interface Role axis argues is the right shape — then QDMI's
@@ -1873,7 +2207,10 @@ implementations are expressible and discoverable, runtime version reporting,
 and reserved vendor space. To that should be added what neither has: a stated
 policy for what happens when a caller is newer than an implementation, and the
 discipline of treating accumulation in the custom slots as a backlog for the
-next revision rather than as a permanent home. And whichever model is chosen,
+next revision rather than as a permanent home. Both of those moved from
+hypothetical to observed in this recheck. The newer-caller policy has a measured
+failure, one patch release of drift returning the wrong error code. The
+custom-slot backlog has a named first item, the calibration set ID. And whichever model is chosen,
 capability must be declarable — the recurring cost across this document is that
 a caller cannot ask what a resource actually supports before depending on it.
 
