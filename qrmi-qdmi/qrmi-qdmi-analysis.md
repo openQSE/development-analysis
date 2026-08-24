@@ -1906,13 +1906,66 @@ source's adapter breaks when the *interface* changes. The thick source's adapter
 breaks when the *provider payload* changes, which happens more often, is not
 governed by the interface's own versioning, and does not announce itself.
 
-Two lessons for a specification, neither about schemas. First, an optional field
+**A second instance landed while this section was being written, one layer
+lower, and it did not resolve the way the others did.** A QRMI developer
+reported on 2026-08-24 that IQM changed the response format of the Get Health
+Status API and deployed it to IQM Resonance, which broke `is_accessible()` in
+QRMI's IQM implementation.
+
+The mechanism is worth recording because it is not a consumer bug. QRMI's IQM
+client is generated from IQM's OpenAPI document, and the generated
+`IqmServerQcHealthStatus` declared both `healthy` and `updated_at` as required
+fields rather than options. A provider-side change to either one fails
+deserialization inside QRMI itself, and the caller sees the reachability check
+error out. Nothing in QRMI's own version number moves when that happens. A site
+can hold a library version fixed, change nothing, and have a call stop working.
+
+**QRMI 0.24.0 adapted to the new format, and the interesting part is what that
+did rather than what it fixed.** The two shapes are incompatible: the old
+response is flat, `{"healthy": ..., "updated_at": ...}`, and the new one nests,
+`{"operational": ..., "health": {...}}`. Both fields are required in whichever
+model the client carries. So each QRMI version speaks exactly one of them.
+
+The ORNL q20 was checked at both versions. It still serves the old flat shape,
+verified again on 2026-08-27. Under 0.23.1 `is_accessible()` returned true
+there and failed on Resonance. Under 0.24.0 it fails there, with
+`error in serde: missing field 'operational'`, and works on Resonance.
+
+**Upgrading the client did not fix the failure. It moved it to the other
+deployment.** There is no released QRMI version that answers this call correctly
+against both sites at once, and a site operator has no lever that would produce
+one, because the choice is not theirs to make. That is a sharper statement of
+the problem than the one this section started with. The behavior of an
+interface call is a property of the provider deployment rather than of the
+interface version, neither the interface nor its version number lets a caller
+tell which deployment it is talking to, and when a provider stages a breaking
+change across its own estate, every client version is wrong somewhere for the
+duration.
+
+Three lessons for a specification, none about schemas. First, an optional field
 that a source has never populated is untested code in every consumer, and the
 day the source starts sending it is indistinguishable, downstream, from a
 breaking change. Optional-and-absent and optional-and-present should be
 exercised before they are relied on. Second, if a normalized record is going to
 carry a passthrough of provider-native data, the interface should version that
-passthrough, or consumers will keep discovering its shape by crashing.
+passthrough, or consumers will keep discovering its shape by crashing. Third,
+generated clients over provider APIs inherit the provider's release cadence
+regardless of their own. A specification that expects independent
+implementations needs to say what a required field means when the provider
+stops sending it, and an implementation generated from a provider schema should
+treat response fields as optional unless the provider commits to them, because
+the alternative is that a remote deployment can break a pinned client.
+
+The staged-rollout case adds a fourth, and it is the one with no obvious answer.
+A single client version cannot be correct against a provider that is midway
+through changing its own API across sites. Tolerating both shapes is the only
+behavior that works everywhere, which means a generated client should accept
+either the old or the new schema during a transition rather than exchanging one
+for the other. QRMI does this deliberately elsewhere and has the machinery for
+it: the IBM resource-type rename in 0.23.0 accepts both the legacy and the new
+names until a published date. The health-status change got a replacement
+instead of a transition, and the difference is not that one is harder. It is
+that one was recognized as a migration and the other was treated as a fix.
 
 For a common spec: the normalized record schema is the contract, and the
 normalizer is a per-source adapter. A single schema with clearly optional,
