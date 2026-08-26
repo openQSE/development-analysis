@@ -23,7 +23,7 @@ Unless an entry says otherwise, observations were made against:
 
 | Component | Version | Role |
 |---|---|---|
-| `qrmi` | 0.23.1 | QRMI interface and its IQM resource implementation |
+| `qrmi` | 0.24.0 | QRMI interface and its IQM resource implementation |
 | `iqm-qdmi` | 1.3.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
 | `mqt-core` | 3.9.0 | QDMI client, headers, and the FoMaC layer the Python caller uses |
 | `QDMI` | 1.3.3 client-side, 1.3.2 device-side | the specification each side was built against. See below, the difference is load-bearing |
@@ -38,10 +38,11 @@ the QFw shim (`openQSE/QFw`, `services/svc_lib_qpm`).
 **These versions replace an earlier baseline of `qrmi` 0.17.2, `iqm-qdmi` 1.2.0,
 and `mqt-core` 3.7.0, and the axes below have been rechecked against them.**
 Most findings survived. Where one did not, the axis says what changed rather
-than quietly presenting the new state as though it had always held. Three
+than quietly presenting the new state as though it had always held. Four
 findings moved materially: the calibration set identity under Device
 Introspection and Calibration And Quality Data, queue position under Telemetry,
-and the not-supported answer under Extensibility And Versioning.
+the not-supported answer under Extensibility And Versioning, and most of the
+Error Model axis, three of whose central claims have been fixed upstream.
 
 The two QDMI rows are deliberately separate. The client side of this
 comparison, MQT Core 3.9.0, is built against QDMI 1.3.3. The device side,
@@ -66,7 +67,7 @@ by later commits to those same files.
 The remaining `qrmi` line-number citations kept their numbers on the argument
 that the pinned 0.17.2 tag was not moving. The pin moved. Those citations are
 now anchored to 0.17.2 as a historical reference and have drifted against
-0.23.1, which is the version this document otherwise describes. They are marked
+0.24.0, which is the version this document otherwise describes. They are marked
 where they appear. The lesson generalizes past this document: a citation whose
 validity rests on a pin is only as stable as the decision not to upgrade.
 
@@ -1959,13 +1960,16 @@ data.
 <details>
 <summary><strong>QRMI Behavior</strong></summary>
 
-QRMI's `QuantumResource` methods propagate most failures as exceptions: the
-Python binding converts an internal `anyhow` error into a `PyRuntimeError`. The
-device-introspection path is an exception to this rule. For an IQM resource,
-`target()` assembles its result from three IQM Server REST calls
-(`dynamic-quantum-architecture`, the calibration set, and quality metrics), and
-each call is individually guarded so that a failure is logged and the field is
-replaced with `null`:
+**This axis has changed more than any other since the first version of this
+document, and almost entirely in one direction. All three of its findings have
+been fixed upstream.** The behavior it described is recorded below because the
+sequence is instructive, but none of it is current.
+
+**What it used to do.** QRMI's methods propagated most failures as exceptions,
+with the Python binding converting an internal `anyhow` error into a bare
+`PyRuntimeError`. The introspection path was the exception. `target()` assembles
+its result from three IQM Server REST calls, and each was individually guarded
+so a failure was logged and the field replaced with `null`:
 
 ```rust
 resp["dynamic_quantum_architecture"] = match get_dynamic_quantum_architecture_v1(...).await {
@@ -1974,17 +1978,53 @@ resp["dynamic_quantum_architecture"] = match get_dynamic_quantum_architecture_v1
 };
 ```
 
-`target()` therefore returns `Ok` with null fields on partial or total failure;
-the HTTP status is never propagated to the caller.
+So `target()` returned `Ok` with null fields on partial or total failure, and
+the HTTP status never reached the caller. Diagnostics depended on the `log`
+crate, `env_logger` was initialized only in the standalone binaries, and there
+was no bridge into Python. A failed fetch therefore surfaced as empty data with
+no exception and no log line. (Verified against tag `0.17.2`.)
 
-Diagnostics depend on the `log` crate (`log::error!`). In QRMI, `env_logger` is
-initialized only in the standalone example and CLI binaries, not in the Python
-extension, and there is no `pyo3-log` bridge. When QRMI is used as a Python
-library, no logging backend is registered, so those `error!` records are
-dropped and `RUST_LOG` has no effect. A failed device fetch then surfaces as
-empty data with no exception and no log line.
+**Null substitution was removed in 0.22.0.** Counting the substitutions in
+`src/iqm/server.rs` dates it exactly: six occurrences of `json!(null)` in every
+release from 0.17.2 through 0.21.0, and zero from 0.22.0 on. The three required
+fetches now propagate with `?`, and the function's own documentation states the
+new contract, that it returns `Err` rather than a document with a field
+silently replaced by `null`.
 
-(Verified against QRMI tag `0.17.2`, the version pinned in the QFw container.)
+One field is a deliberate exception, and it is the right kind. The
+`static_quantum_architecture` added in the same release is optional, because
+the artifact's availability depends on the quantum computer's Station Control
+version, so a 404 for it specifically is still represented as `null` while any
+other failure propagates. That is a documented optional field rather than a
+swallowed error, which is the distinction the old behavior failed to make.
+
+**A logging backend now exists, and `RUST_LOG` now matters.** 0.22.0 bridged
+Rust `log` records into Python's `logging`. `qrmi.logger` is a real stdlib
+logger named `qrmi`, a sink is installed at import, and `set_log_callback`
+replaces it. The gate is `RUST_LOG`: with it unset nothing is emitted at all,
+and with `RUST_LOG=debug` a single `target()` call yields one
+`reqwest::connect` record. So the old claim inverts. There is a backend, and
+`RUST_LOG` is exactly what governs it.
+
+**Failures became typed in 0.24.0.** Rust gained a `QrmiError` enum with a
+`.kind()` method, C gained `qrmi_get_last_error_kind()` and a return-code enum
+that grew from three values to twelve, and Python gained an exception hierarchy
+under `qrmi.QrmiError`. Four conditions are classified specifically: resource
+not found, task not found, authentication failed, and invalid input. Anything
+else falls back to a generic `Other`, including HTTP statuses such as 403 that
+vendors use inconsistently enough that guessing was judged worse than not.
+
+**Verified on the current version.** The precise failure this axis documented,
+a base URL with a trailing slash producing `//api/v1/...`, was re-run against
+the ORNL q20 under 0.24.0. It now raises, and it raises classified:
+
+```
+target() RAISED: AuthenticationFailedError
+  authentication failed: {"error_code":"unauthorized", ...}
+```
+
+Under the documented behavior the same call returned a fully-null target with
+no exception and no log.
 
 </details>
 
@@ -2008,33 +2048,55 @@ rather than as substituted data.
 <details>
 <summary><strong>Comparison Analysis</strong></summary>
 
-The two interfaces sit at opposite ends of error visibility. QDMI reports
-failures as typed codes at the call that failed. QRMI reports execution failures
-as exceptions but, on the introspection path, degrades to `null` data instead of
-raising; combined with the absence of a logger in its Python build, the
-underlying cause is invisible to the caller.
+**The gap this axis described has closed, and the two interfaces now sit much
+closer together.** QDMI reports failures as typed codes at the call that failed.
+QRMI, as of 0.22.0 and 0.24.0, raises on the introspection path instead of
+substituting `null`, classifies its failures, and has a logging backend that is
+active when it is embedded as a library. Each of those was a separate finding
+here and each is now historical.
 
-This was observed directly in QFw testing. A configured base URL with a trailing
-slash caused QRMI's IQM client to build `//api/v1/...`; all three `target()`
-fetches returned 404; and the shim received a fully-null target with no
-exception and no log. The same class of failure on the QDMI path would surface
-as a non-success status at the query.
+**The original observations are worth keeping, because they show what the old
+behavior cost.** Two were recorded from QFw testing. A configured base URL with
+a trailing slash made QRMI's IQM client build `//api/v1/...`, all three
+`target()` fetches failed, and the shim received a fully-null target with no
+exception and no log. The second went further. With the IQM endpoint
+unreachable, `target()` again returned successfully with all three fields null,
+and because the QRMI execution path consumes that same cached document to build
+its run request, the connectivity failure surfaced two layers up at circuit
+transcoding as "IQM dynamic architecture did not report active qubits". An
+availability fault presented as a device-data fault. The null substitution did
+not only degrade introspection, it fed misleading state into submission.
 
-A second instance, from the live-hardware runs, extends the consequence into
-execution. With the IQM endpoint unreachable (a dropped SSH tunnel in the
-remote-access setup), all three fetches failed at the TCP level and `target()`
-again returned successfully with all three fields null. The QRMI execution path
-consumes the same cached `target()` document to build its run request, so the
-connectivity failure surfaced two layers up, at circuit transcoding, as "IQM
-dynamic architecture did not report active qubits" — an availability fault
-presenting as a device-data fault. The null-substitution therefore does not
-only degrade introspection data; it feeds misleading state into submission.
+That second case is the argument for why silent degradation is worse than it
+first looks. A null field is not a smaller version of an error. It is an error
+converted into plausible data, and plausible data travels.
 
-For a common spec: an introspection/target call needs a defined
-error-propagation contract (a typed error or a raised exception), and provider
-adapters should not silently substitute empty data for a failed fetch. A related
-requirement is observability — a logging facility that is active when the
-interface is embedded as a library, not only in its standalone binaries.
+**Two things are worth drawing out of the fix rather than just noting it.**
+
+The first is about who found it. This behavior was visible from a consumer, and
+it was visible because the consumer was a *shim* spanning two libraries, so the
+same failure could be watched through both paths and only one of them lied
+about it. A single-library integration would have seen empty data and had
+nothing to compare it against. That is the shim earning its keep as a learning
+vehicle rather than as a piece of infrastructure.
+
+The second is about sequencing. The three fixes landed in the order
+raise-then-classify: 0.22.0 made failures visible, 0.24.0 made them
+distinguishable. That is the right order and it is worth stating as a
+recommendation, because a specification that mandates a rich taxonomy of error
+kinds before it mandates that errors be raised at all has optimized the wrong
+half. The taxonomy is only reachable once the failure stops being swallowed.
+
+For a common spec, the requirements are unchanged, and the point is that they
+are now met by both implementations rather than one. An introspection or target
+call needs a defined error-propagation contract, a raised error or a typed
+code. Provider adapters must not substitute empty data for a failed fetch, and
+where a field is genuinely optional, that must be declared as optionality
+rather than expressed as a swallowed failure indistinguishable from it. And a
+logging facility has to be active when the interface is embedded as a library,
+not only in its standalone binaries. QRMI's `static_quantum_architecture`,
+optional by documentation and null only on a 404, is the shape the middle
+requirement is asking for.
 
 </details>
 
@@ -2121,7 +2183,18 @@ adding enum values behind unchanging function signatures, so a device library
 built against an older header keeps working and an updated caller learns what
 is missing through `NOTSUPPORTED`. QRMI adds capability by adding enum variants
 and trait methods, both of which are breaking changes, and offers no way to
-express partial support. That is the difference between an interface designed
+express partial support.
+
+That needs one qualification after the 0.24.0 recheck. QRMI grew an entire error
+taxonomy in that release and got it into Python additively, by having every new
+exception subclass the `RuntimeError` its failures were always raised as, so
+existing `except RuntimeError` code kept working untouched. The Rust side did
+break, since the public signature moved from `anyhow::Error` to a `QrmiError`
+enum. So the claim holds where QRMI is consumed as a Rust crate and does not
+hold where it is consumed through its Python bindings. The difference is not
+luck. It is that the Python surface had a pre-existing supertype to hang the new
+types under, which is the same trick QDMI's reserved enum space plays and an
+argument for designing that room in from the start. That is the difference between an interface designed
 to be implemented by parties who release on their own schedule and one designed
 to be edited in place.
 
