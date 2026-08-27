@@ -1524,16 +1524,68 @@ QDMI-on-IQM issued each request through cpr's free-function API (`cpr::Get` /
 session, and with it the underlying libcurl handle and its connection cache, per
 call. No session was retained across requests, so each one reconnected.
 
-**These figures are 1.2.0-era and the mechanism has moved twice since.** 1.3.0
-replaced the free functions with a per-request `cpr::Session`, which changed the
-shape of the code without changing the outcome, since destroying the session
-still discarded the connection cache. 1.4.0 added a `cpr::ConnectionPool` owned
-by each device session and shared across initialization, architecture
-refreshes, submission, polling, result retrieval, cancellation and retries, so
-the five init requests can now reuse a connection. **The cold number above
-should be re-measured before it is cited again.** It is left in place because
-it is the measurement the change responded to, and replacing it with an
-unmeasured claim would be worse than marking it stale.
+**Those figures are 1.2.0-era. The mechanism moved twice since, and the path
+has been re-measured at 1.4.0.** 1.3.0 replaced the free functions with a
+per-request `cpr::Session`, which changed the shape of the code without changing
+the outcome, since destroying the session still discarded the connection cache.
+1.4.0 added a `cpr::ConnectionPool` owned by each device session and shared
+across initialization, architecture refreshes, submission, polling, result
+retrieval, cancellation and retries.
+
+Re-measured on the same device and the same home broadband path the original
+figures used, 5 cold samples each in a fresh process, with QRMI measured in the
+same session as a control:
+
+| | 1.2.0 / qrmi 0.17.2 | 1.4.0 / qrmi 0.24.0 |
+|---|---|---|
+| QDMI cold total (median) | 3376.8 ms | **1526.8 ms** |
+| QDMI connections at session init | 5 | **1** |
+| QDMI warm property queries | 12-17 ms | 12-16 ms |
+| QRMI cold total (median), control | 1334.6 ms | 1452.0 ms |
+
+**QDMI-on-IQM's cold cost fell by 55%, and the connection count is why.** Five
+TLS handshakes became one. The same five requests are still issued and the warm
+figures are unmoved, which is what isolates the handshakes as the cause.
+
+**The comparative claim this axis made no longer holds, and that is the more
+important result.** Cold start was the sharpest quantitative difference between
+the two libraries, with QDMI-on-IQM costing 2.5 times what QRMI did. It is now
+1526.8 ms against 1452.0 ms, a difference of about 5%, inside the run-to-run
+spread. **On this measure the two libraries have converged.**
+
+The control also answers a question the version bump raised. QRMI's `target()`
+gained a fourth REST call in 0.22.0, the static architecture, and its cold cost
+moved from 1334.6 ms to 1452.0 ms. The added fetch costs roughly 120 ms, and
+nothing else regressed across seven releases.
+
+An earlier attempt at this re-measurement was taken over a mobile tether and is
+not reported here, because the link was not the one the baseline used. Why it
+was discarded is worth recording. QRMI, the unchanged control, came in at
+6265.6 ms against its documented 1334.6 ms, and a five-fold move in a library
+that had not changed is what identified the measurement rather than the software
+as the variable. Without a control in the same session, the QDMI figure from
+that run would have looked like a plausible result.
+
+**The payload difference is a property of the data and survives both links.**
+Timing the individual REST calls, the IQM calibration-set document is
+**1,264,529 bytes** against 3 KB for the dynamic architecture, and that size is
+byte-identical across both measurements. The transfer time is not: 0.62 to 0.93
+seconds on broadband against 7.7 to 12.4 seconds over the tether. QRMI's
+`target()` fetches that document. QDMI-on-IQM does not, because it reduces the
+quality metrics device-side before anything crosses the interface.
+
+So the thick and thin split described under Calibration And Quality Data is not
+only a difference in what a caller receives. It is a difference in what crosses
+the wire, and how much that costs is a question about the link rather than about
+either library. On broadband the 1.2 MB fetch runs about 0.2 seconds slower than
+the 3 KB one and is close to free. Over the tether it cost seven to eleven
+seconds more. The same implementation choice is invisible on a fast path and
+dominant on a slow one, which is the same shape as the connection-handling
+finding above and the reason neither should be filed as a micro-optimization.
+
+Every figure in this axis was taken from outside ORNL, over the tunnel. The
+on-site re-run remains outstanding and would compress these differences further
+still.
 
 **This one has a documented cause, and it is us.** The upstream pull request
 that added the pool states its motivation as the connection behavior measured in
@@ -1643,12 +1695,21 @@ device something more than once — both interfaces are roughly forty times
 cheaper than talking to the provider directly, because both introduced a cache
 the provider client does not have.
 
-The difference between the two interfaces is entirely in cold start, and it is
+The difference between the two interfaces was entirely in cold start, and it was
 large: 1334.6 ms for QRMI against 3376.8 ms for QDMI-on-IQM under identical
 conditions, with the native client at 2831.1 ms in the same three-arm run. That
 is the cost a component pays when it must observe from a fresh process — a
 per-job scheduler hook, a monitoring probe, a short-lived task — which is
 precisely the pattern a resource manager uses.
+
+**That gap has since closed.** Re-measured on the same path at iqm-qdmi 1.4.0,
+QDMI-on-IQM is 1526.8 ms against a QRMI control at 1452.0 ms, about 5% apart.
+The paragraphs below diagnosed the cause as connection handling rather than
+interface design and said it was fixable by retaining a session across requests.
+That is what upstream did, and the numbers moved as predicted. The reasoning is
+left standing rather than rewritten, because the diagnosis holding up is the
+useful part, and because the native-client arm was not re-run so the three-way
+comparison above is still the only one measured.
 
 Note where the native baseline falls: slower than QRMI, close to QDMI-on-IQM.
 Neither interface imposes a cold-start penalty over talking to the provider
@@ -1661,6 +1722,13 @@ explained by connection reuse: one pooled connection and one TLS handshake
 against five connections and five handshakes. This is a property of the
 QDMI-on-IQM implementation, fixable there by retaining a session across
 requests, and it should not be read as a property of the QDMI interface.
+
+That claim has now been tested rather than argued. iqm-qdmi 1.4.0 added a
+per-device connection pool, the handshake count went from five to one, and the
+cold gap went with it. An implementation detail carried the whole of a
+difference that could easily have been attributed to the interface, which is
+worth remembering the next time a comparison of this kind produces a clean
+number.
 
 **Why this was measured over a wide-area path, and why that is not a
 disclaimer.** These numbers were taken from outside the site, over an SSH
