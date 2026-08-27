@@ -24,9 +24,9 @@ Unless an entry says otherwise, observations were made against:
 | Component | Version | Role |
 |---|---|---|
 | `qrmi` | 0.24.0 | QRMI interface and its IQM resource implementation |
-| `iqm-qdmi` | 1.3.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
-| `mqt-core` | 3.9.0 | QDMI client, headers, and the FoMaC layer the Python caller uses |
-| `QDMI` | 1.3.3 client-side, 1.3.2 device-side | the specification each side was built against. See below, the difference is load-bearing |
+| `iqm-qdmi` | 1.4.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
+| `mqt-core` | 3.9.2 | QDMI client, headers, and the FoMaC layer the Python caller uses |
+| `QDMI` | 1.3.3 on both sides | the specification each side was built against. They were one patch release apart until iqm-qdmi 1.4.0, and that gap was load-bearing. See below |
 | `iqm-client` | 34.0.1 | IQM Server client used by the QFw drivers |
 | `iqm-station-control-client` | 12.1.1 | IQM station-control models |
 | `iqm-pulse` | 13.0.1 | IQM circuit objects produced by transcoding |
@@ -44,14 +44,18 @@ Introspection and Calibration And Quality Data, queue position under Telemetry,
 the not-supported answer under Extensibility And Versioning, and most of the
 Error Model axis, three of whose central claims have been fixed upstream.
 
-The two QDMI rows are deliberately separate. The client side of this
-comparison, MQT Core 3.9.0, is built against QDMI 1.3.3. The device side,
-QDMI-on-IQM 1.3.0, is built against QDMI 1.3.2. One patch release apart, and
-that gap is directly observable from the caller. It is discussed under
-Extensibility And Versioning rather than treated as an artifact of the test
-setup, because independently released device libraries lagging the client is
-the normal condition for the ABI model QDMI is built on, not an accident of
-this measurement.
+The QDMI row records a version for each side because for part of this recheck
+they differed. The client, MQT Core 3.9, was built against QDMI 1.3.3 while the
+device library, QDMI-on-IQM 1.3.0, was built against 1.3.2. One patch release
+apart, and directly observable from the caller. **iqm-qdmi 1.4.0 closed that gap
+by moving to 1.3.3**, so the two sides now agree and the specific failure is no
+longer reproducible on this stack.
+
+It is still recorded under Extensibility And Versioning, and deliberately so. A
+defect that a version bump made disappear is not the same as a defect that was
+never real, and independently released device libraries lagging the client is
+the normal condition for the ABI model QDMI is built on rather than an accident
+of this measurement. The next such gap will behave the same way.
 
 On source citations. Where this document cites QDMI-on-IQM source it means the
 corresponding upstream tag, not any local working tree — `iqm-qdmi` ships as a
@@ -636,16 +640,14 @@ observable, so a scheduler can detect divergence between the order it chose and
 the order it got. Without that channel, quantum resources cannot be scheduled
 by an HPC site in any meaningful sense — they can only be submitted to.
 
-**One of those three requirements is now partly met, which usefully separates
-the other two.** The observability half moved. QDMI 1.3.3 named
+**One of those three requirements has now been met on the QDMI side, which
+usefully separates the other two.** QDMI 1.3.3 named
 `QDMI_JOB_PROPERTY_QUEUEPOSITION` and `QDMI_DEVICE_PROPERTY_QUEUELENGTH`, MQT
-Core 3.9 binds both, and on the QRMI side the provider's job timeline was
-already reaching the caller through `task_logs()`, if only as formatted text
-(see Telemetry). The device implementation has not caught up on the QDMI side
-and the QRMI side returns prose rather than data, so nothing is usable today.
-But the specification question is settled for observability: it is agreed that
-a caller should be able to see queue state, and the remaining work is
-implementation.
+Core 3.9 bound both, and iqm-qdmi 1.4.0 serves them. A scheduler on the QDMI
+path can now ask how deep the queue is and where its job sits, and get an
+answer. On the QRMI side the provider's job timeline reaches the caller through
+`task_logs()`, but as formatted text rather than data (see Telemetry), so that
+half is present and not yet usable.
 
 Carrying intent **down** has not moved at all. There is still no priority, no
 deadline, no ordering key, and no way for a site to tell a provider that its
@@ -653,10 +655,15 @@ reservation means something. That asymmetry is worth stating plainly, because
 the two halves have different politics. Reporting queue state costs a provider
 nothing and reveals little. Honouring an external ordering decision means
 ceding control of the provider's own queue to a customer, which is a commercial
-question before it is a technical one. Expect the observability half to arrive
-and the intent half to stall, and note that observability alone converts the
-problem from invisible to merely unfixable: the site will be able to measure
-that its ordering was discarded, and still have no way to prevent it.
+question before it is a technical one.
+
+That prediction is now partly tested rather than speculative. The observability
+half went from specified to shipped in a single release once there was a named
+property to fill. The intent half has not moved in any release observed here.
+Observability arriving alone converts the problem from invisible to merely
+unfixable: a site can now measure that its ordering was discarded and still has
+no way to prevent it. That is progress, and it is worth being precise that it is
+the cheaper half.
 
 </details>
 
@@ -1486,23 +1493,59 @@ Neither existed in 1.3.2. MQT Core 3.9 binds both, as `Job.queue_position` and
 `Device.queue_length`, each returning an optional value. So the specification
 now has a defined place to put the number, and the client layer can carry it.
 
-QDMI-on-IQM 1.3.0 still does not. Its job property handler serves `ID`,
+QDMI-on-IQM 1.3.0 still did not. Its job property handler served `ID`,
 `PROGRAMFORMAT`, `PROGRAM`, `SHOTSNUM`, and the five `CUSTOM` slots, then
-returns not-supported. The submission response is still parsed only into a log
-line. The finding therefore sharpens rather than dissolves: the value the
-provider sends is now one stored field and one property case away from reaching
-a caller, and the remaining work sits entirely in the device implementation
-rather than in the specification.
+returned not-supported, and the submission response was still parsed only into a
+log line.
+
+**iqm-qdmi 1.4.0 closed it.** The job now stores the position and the handler
+serves `QDMI_DEVICE_JOB_PROPERTY_QUEUEPOSITION`, and the same release moved the
+library to QDMI 1.3.3 so the device-level `QDMI_DEVICE_PROPERTY_QUEUELENGTH`
+answers too. Both were verified on the ORNL q20: `Device.queue_length()` returns
+`0` where it previously raised, and `Job.queue_position` returns cleanly. It
+reads `None` on that device today, which is the honest answer rather than a
+failure, because a queue of length zero has no position to report.
+
+So this finding is closed, and the sequence it took is the part worth keeping.
+The value was arriving from the provider the entire time. It went from parsed
+and discarded, to named in the specification but unreachable because the device
+library predated the name, to reachable. Three releases across two projects to
+surface an integer that had been in the submission response all along. **The
+gap was never that the information did not exist. It was that no layer had been
+given a defined place to put it.**
 
 Cost of observing. The IQM device library fetches during session init, so the
 cost is paid when the device is opened; property queries afterwards are local
 reads. Measured on the same device and path: 3376.8 ms median cold (5 samples,
-3193-3397 ms), then 12-17 ms for repeat queries, no network. Session init opens
-**five separate TCP connections** — five TLS handshakes. QDMI-on-IQM issues each
-request through cpr's free-function API (`cpr::Get` / `cpr::Post` in
-`src/internal/http_client.cpp`), which constructs and destroys a session, and
-with it the underlying libcurl handle and its connection cache, per call. No
-session is retained across requests, so each one reconnects.
+3193-3397 ms), then 12-17 ms for repeat queries, no network. Session init opened
+**five separate TCP connections** — five TLS handshakes. At the measured version
+QDMI-on-IQM issued each request through cpr's free-function API (`cpr::Get` /
+`cpr::Post` in `src/internal/http_client.cpp`), which constructs and destroys a
+session, and with it the underlying libcurl handle and its connection cache, per
+call. No session was retained across requests, so each one reconnected.
+
+**These figures are 1.2.0-era and the mechanism has moved twice since.** 1.3.0
+replaced the free functions with a per-request `cpr::Session`, which changed the
+shape of the code without changing the outcome, since destroying the session
+still discarded the connection cache. 1.4.0 added a `cpr::ConnectionPool` owned
+by each device session and shared across initialization, architecture
+refreshes, submission, polling, result retrieval, cancellation and retries, so
+the five init requests can now reuse a connection. **The cold number above
+should be re-measured before it is cited again.** It is left in place because
+it is the measurement the change responded to, and replacing it with an
+unmeasured claim would be worse than marking it stale.
+
+**This one has a documented cause, and it is us.** The upstream pull request
+that added the pool states its motivation as the connection behavior measured in
+`openQSE/QFw#34`, the QFw measurement scripts, and reproduces the finding: five
+sequential requests at initialization, each establishing its own TCP and TLS
+connection because an independent session was created and destroyed per request.
+
+That is worth separating from the other upstream fix this document records. The
+QRMI null-substitution repair under Error Model is **not** claimed as caused by
+this work, because there is no record of it having been reported and timing is
+not evidence. Here the causal link is not inferred from timing. It is written
+into the change itself.
 
 </details>
 
@@ -1530,13 +1573,15 @@ different ways, which is a better finding than absence.
 | | What the provider sends | Where it stops |
 |---|---|---|
 | QRMI | Job timeline, one entry per state transition with timestamp, source, and status | Reaches the caller, but flattened by `task_logs()` into a preformatted display string |
-| QDMI-on-IQM | Queue position in the submission response | Parsed, appended to an INFO log line, never stored on the job |
+| QDMI-on-IQM | Queue position in the submission response | Was parsed into an INFO log line and never stored. **Served as a job property from iqm-qdmi 1.4.0** |
 
-Neither loss is architectural. QRMI already holds the timeline as structured
-data and chooses to render it. QDMI-on-IQM already parses the integer and
-chooses to log it, and since QDMI 1.3.3 there is a named property waiting for
-it. In both cases the value crossed the network, entered the library, and was
-discarded above the wire and below the caller.
+Neither loss was architectural, and one of them has since been repaired. QRMI
+still holds the timeline as structured data and chooses to render it.
+QDMI-on-IQM parsed the integer and chose to log it until 1.4.0, which stores and
+serves it. In both cases the value crossed the network, entered the library, and
+was discarded above the wire and below the caller. That one of the two was fixed
+by a single release, once the specification had somewhere to put the value, is
+evidence for how shallow the remaining loss is on the other side.
 
 That divides the remaining work in a way this axis did not previously make
 explicit. Pushing scheduling intent **down** to the provider needs the provider
@@ -2238,6 +2283,15 @@ and receive a defined answer. Upgrading the client side to MQT Core 3.9, built
 against QDMI 1.3.3, while the device library remained QDMI-on-IQM 1.3.0, built
 against QDMI 1.3.2, produced a case where it does not.
 
+**This particular instance has since closed. iqm-qdmi 1.4.0 moved the device
+library to QDMI 1.3.3, so both sides now agree and the call below succeeds.**
+The finding is kept rather than deleted, for a reason that matters more than the
+individual bug. What fixed it was the device library catching up, which is
+exactly the thing an ABI model exists to avoid having to require. Nothing about
+the error-reporting contract changed. Re-open any two components at different
+QDMI versions and the same confusion returns, and the whole point of shipping
+device libraries independently is that they will be at different versions.
+
 Asking the q20 for `Device.queue_length()` returns
 `QDMI_ERROR_INVALIDARGUMENT`, surfaced in Python as
 `ValueError: Querying QUEUE LENGTH: Invalid argument`. Not
@@ -2261,6 +2315,12 @@ question" from "you passed garbage". A conformance requirement that unknown
 values in the reserved property range return `NOTSUPPORTED` rather than
 `INVALIDARGUMENT` would cost an implementation one comparison, and would make
 capability probing work across versions, which is the thing it is for.
+
+The upgrade that closed this is itself the argument for the requirement. A
+caller could only recover by waiting for the vendor to ship a library built
+against the newer specification. That is precisely the coupling the ABI and the
+typed error were meant to remove, and for the duration of the gap they did not
+remove it.
 
 **Runtime version discovery is a real asymmetry.** QDMI lets a caller ask a
 just-loaded library which version it implements. QRMI has no equivalent,
