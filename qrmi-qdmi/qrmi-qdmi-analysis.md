@@ -199,6 +199,44 @@ before. QRMI hands back raw vendor payloads while QDMI returns typed neutral
 values, because a resource manager is passing data through and a tool is
 consuming it.
 
+**The layering claim has since been tested from the QDMI side, and it held.**
+MQT Core 3.9 added `mqt.core.qdmi.slurm.open_device_from_license()`, which reads
+`SLURM_JOB_LICENSES` and opens the QDMI device whose stable ID matches the
+license name. It ships with a documented cluster tutorial and a CI fixture
+running a real two-node Slurm cluster. On the face of it that is QDMI reaching
+into the resource manager, which is the layer this axis assigns to QRMI.
+
+What crossed the boundary is worth being exact about, because only one thing
+did. The adapter performs **device selection** and nothing else. MQT Core's own
+documentation separates four controls and keeps them independent: Slurm admits
+jobs and accounts for the license count, the adapter uses the license
+environment to select a device, the provider reports availability and queue
+state, and the provider or the operating system authorizes access. The function
+docstring says plainly that it does not verify a Slurm allocation, authenticate
+the caller, or authorize device access.
+
+**And it gives a reason why it cannot, which is the sharpest statement of the
+layering argument found anywhere in either project.** From the tutorial: a
+lookup through a more trustworthy Slurm interface would still not make MQT Core
+an access-control boundary, because a program can call
+`driver.open_device(device_id)` directly. A device contract sits below the
+enforcement point by construction. Anything it checks can be bypassed by calling
+the layer underneath, which is the layer it *is*. So the question of whether
+QDMI could grow into a resource manager is not a matter of scope or ambition. A
+device interface cannot enforce admission on itself, and the moment it tried,
+callers would route around it.
+
+That is the same conclusion this axis reached from the other direction, arrived
+at independently by the people implementing the device side, and it is stronger
+evidence for the two-layer reading than the original argument was.
+
+**Note also that QDMI is growing in the other direction at the same time.** 3.9
+added a PennyLane device alongside the existing Qiskit backend, so the same
+release reaches down toward the resource manager for device selection and up
+toward application frameworks for execution. Neither move is toward QRMI's
+position. A device contract acquiring adapters on both sides is what a device
+contract doing well looks like.
+
 **The plurality models have different costs, and neither is free.** QRMI's
 concentrates integration effort in one project: every new backend is a change
 to QRMI, which gives consistency and a single place to reason about behaviour,
@@ -309,6 +347,15 @@ candidate. The new one separates the catalogue from the loading, so a caller
 can enumerate what a host is configured to offer, and pay the cost of opening
 only the one it picks. That is closer to what a resource manager needs than
 what the session enumeration alone provided.
+
+3.9 added a third form, narrower than either. `mqt.core.qdmi.slurm`'s
+`open_device_from_license()` reads `SLURM_JOB_LICENSES` and opens the device
+whose stable ID matches the license name, so the site's own admission decision
+becomes the selection. It is a discovery mechanism in which the caller does not
+choose. What makes that possible is the stable-ID registry: a name that means
+the same thing to SLURM's configuration and to the QDMI driver is what lets an
+external system name a device at all. See Admission for what it does and does
+not decide.
 
 Capability is advertised by the device and queried per property.
 `Device.supported_program_formats()` returns the formats that device accepts,
@@ -483,6 +530,27 @@ scheduler admits, and QRMI's SPANK plugin publishes the outcome into the job
 environment. That is a real, working admission path, and it is worth being
 precise about why: SLURM owns the decision because it holds the state — the
 queue, the allocation, the policy. Neither quantum interface holds any of that.
+
+**The QDMI side reached the same conclusion independently, and picked a
+different SLURM mechanism to do it.** MQT Core 3.9 ships a documented cluster
+tutorial and a CI fixture in which admission is a **SLURM license** whose name
+is a stable QDMI device ID, with `mqt.core.qdmi.slurm.open_device_from_license()`
+reading `SLURM_JOB_LICENSES` to pick the device. SLURM admits and accounts, and
+QDMI is handed the answer. No admission primitive was added to QDMI, which is
+the point: faced with needing admission, the device-side project reached for the
+resource manager rather than growing one.
+
+There are now three site-side mechanisms visible across these projects, all
+doing the same job through different SLURM features. QRMI uses a SPANK plugin
+publishing into the job environment. MQT Core's example uses licenses. QFw uses
+GRES, requesting `--gres=qpu:1`. Licenses are cluster-wide counters and suit a
+remote QPU with no local device file. GRES is per-node and, with a `File=` entry
+and `ConstrainDevices=yes`, is the only one of the three that can actually
+restrict what a job opens. That three independent integrations picked three
+different mechanisms, and that the choice turns on whether the device is local,
+is a reasonable measure of how unsettled this is. It is also the clearest
+argument in this document that admission belongs in a resource contract that
+says which mechanism means what, rather than being rediscovered per site.
 
 **For a common spec.** Three things follow. An admission primitive must have
 defined semantics and be discoverable: if a resource does not support holding,
@@ -1893,6 +1961,17 @@ That consistency is worth stating because it is a constraint on how these
 interfaces can grow. The moment either gains a control-plane call — set a
 limit, change a queue policy, register a device, inject a credential — a second
 authorization axis becomes mandatory, and neither has the vocabulary for it.
+
+One argument from the QDMI side is worth importing here, because it constrains
+what this axis can ever ask of a device contract. MQT Core's Slurm tutorial
+notes that consulting a more trustworthy source than the mutable job
+environment would still not make it an access-control boundary, because a
+program can call `driver.open_device(device_id)` directly. A device interface
+sits below the enforcement point by construction, so whatever it checks can be
+bypassed by calling the layer it is. Authorization has to be enforced by the
+provider or the operating system, and a specification that places it in the
+device contract is specifying something that cannot hold. See Interface Role
+And Scope.
 QDMI is marginally better placed, having an identity model and a
 `PERMISSIONDENIED` code already; QRMI would be starting from a token read out
 of an environment variable.
