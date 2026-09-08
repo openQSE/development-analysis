@@ -23,7 +23,7 @@ Unless an entry says otherwise, observations were made against:
 
 | Component | Version | Role |
 |---|---|---|
-| `qrmi` | 0.24.0 | QRMI interface and its IQM resource implementation |
+| `qrmi` | 0.24.4 | QRMI interface and its IQM resource implementation |
 | `iqm-qdmi` | 1.4.0 | QDMI-on-IQM, the QDMI device implementation for IQM |
 | `mqt-core` | 3.9.2 | QDMI client, headers, and the FoMaC layer the Python caller uses |
 | `QDMI` | 1.3.3 on both sides | the specification each side was built against. They were one patch release apart until iqm-qdmi 1.4.0, and that gap was load-bearing. See below |
@@ -71,7 +71,7 @@ by later commits to those same files.
 The remaining `qrmi` line-number citations kept their numbers on the argument
 that the pinned 0.17.2 tag was not moving. The pin moved. Those citations are
 now anchored to 0.17.2 as a historical reference and have drifted against
-0.24.0, which is the version this document otherwise describes. They are marked
+0.24.4, which is the version this document otherwise describes. They are marked
 where they appear. The lesson generalizes past this document: a citation whose
 validity rests on a pin is only as stable as the decision not to upgrade.
 
@@ -516,6 +516,34 @@ Device Discovery gap with consequences: capability is not advertised, so a
 caller cannot ask whether the primitive it is about to rely on is implemented.
 That an implementation carries another backend's documentation for behaviour it
 does not have is a symptom of the same thing.
+
+**This has been partly addressed upstream, and the shape of the partial fix is
+worth more than the fix.** QRMI 0.24.4 added default implementations to the
+`QuantumResource` trait, so a vendor now overrides only what its backend
+supports. The upstream issue proposing it cites this report as motivation. The
+default for most methods returns a new `UnsupportedFunction` error, which is
+exactly the honest absence this axis asked for.
+
+`acquire()` and `release()` did not get that default. Theirs logs a warning and
+then returns success, a generated UUID for `acquire` and `Ok` for `release`,
+with the reason given in the source as backward compatibility, and upstream
+says it will be revisited. At 0.24.4 the IQM implementation has dropped its own
+`acquire`/`release` and now uses those defaults.
+
+So the position today is precise, and worth stating in exactly these terms.
+**`acquire()` on IQM is announced but still not honest.** It warns, at a level
+that reaches an ordinary deployment with no configuration (see Error Model),
+and then hands back a plausible token. The objection was that a no-op returning
+a plausible token cannot be distinguished from a working call. It can now be
+distinguished **in the logs**. It still cannot be distinguished in the return
+value, and there is still no capability query to ask beforehand.
+
+That is real progress, and it is the cheaper half. Emitting a warning costs the
+implementation nothing and breaks no caller. Returning an error instead of a
+token breaks every caller that was relying on the token, which is precisely why
+the two methods that most needed honest absence are the two that did not get
+it. The mechanism for honesty now exists and the case that motivated it is
+still exempt from it.
 
 **Admission needs the telemetry neither interface supplies.** Deciding to
 accept, delay, or reject requires knowing what the device is doing — queue
@@ -2078,6 +2106,28 @@ verified again on 2026-08-27. Under 0.23.1 `is_accessible()` returned true
 there and failed on Resonance. Under 0.24.0 it fails there, with
 `error in serde: missing field 'operational'`, and works on Resonance.
 
+**0.24.3 was released as a fix for exactly this, and it does not reach ORNL.**
+The patch made `operational` optional with a default of `"online"`, for a server
+that predates that field. The `health` object it wraps stayed required, with no
+default and no alias, so a response with no `health` key at all still has
+nothing to bind. Checked at 0.24.4 against a local stub serving each candidate
+shape, then confirmed against the live q20 on 2026-09-08, which is still flat:
+
+| response shape | qrmi 0.24.4 |
+|---|---|
+| `{"healthy": ..., "updated_at": ...}`, the ORNL shape | fails, `missing field 'health'` |
+| `{"health": {...}}` with no `operational` | works |
+| `{"operational": ..., "health": {...}}` | works |
+
+So the error moved a second time, from `missing field 'operational'` to
+`missing field 'health'`, and the count of released versions that answer this
+call correctly on both deployments is still zero. Reported upstream.
+
+The reason it moved rather than resolved is the same each time. Each patch
+widened the model toward one more shape the author had in view. Nothing made
+the model tolerant of shapes in general, which is what a staged rollout across
+a provider's own estate actually requires.
+
 **Upgrading the client did not fix the failure. It moved it to the other
 deployment.** There is no released QRMI version that answers this call correctly
 against both sites at once, and a site operator has no lever that would produce
@@ -2113,6 +2163,13 @@ it: the IBM resource-type rename in 0.23.0 accepts both the legacy and the new
 names until a published date. The health-status change got a replacement
 instead of a transition, and the difference is not that one is harder. It is
 that one was recognized as a migration and the other was treated as a fix.
+
+The two patches since have not changed that, and they show what treating it as
+a fix costs. Each widened the model to admit one further shape someone had in
+front of them, and each left the next site failing. A transition is not a
+sequence of fixes applied until the complaints stop. It is a decision, taken
+once, that both shapes are valid for a stated period, which is precisely what
+the resource-type rename did and what this never did.
 
 For a common spec: the normalized record schema is the contract, and the
 normalizer is a per-source adapter. A single schema with clearly optional,
@@ -2243,13 +2300,24 @@ version, so a 404 for it specifically is still represented as `null` while any
 other failure propagates. That is a documented optional field rather than a
 swallowed error, which is the distinction the old behavior failed to make.
 
-**A logging backend now exists, and `RUST_LOG` now matters.** 0.22.0 bridged
-Rust `log` records into Python's `logging`. `qrmi.logger` is a real stdlib
-logger named `qrmi`, a sink is installed at import, and `set_log_callback`
-replaces it. The gate is `RUST_LOG`: with it unset nothing is emitted at all,
-and with `RUST_LOG=debug` a single `target()` call yields one
-`reqwest::connect` record. So the old claim inverts. There is a backend, and
-`RUST_LOG` is exactly what governs it.
+**A logging backend now exists.** 0.22.0 bridged Rust `log` records into
+Python's `logging`. `qrmi.logger` is a real stdlib logger named `qrmi`, a sink
+is installed at import, and `set_log_callback` replaces it. So the old claim
+inverts. There is a backend, and records do reach a Python caller.
+
+**It is level-filtered, not switched off by default.** An earlier revision of
+this section said `RUST_LOG` gates the bridge and that nothing is emitted
+without it. That was measured only against a DEBUG record and was too broad.
+Rechecked at 0.24.4, with `RUST_LOG` unset a WARN record is delivered and a
+DEBUG one is not, and with `RUST_LOG=debug` both are. So the default threshold
+sits between them.
+
+The distinction is not pedantic, and the Admission axis depends on it. A
+warning QRMI emits reaches an ordinary deployment with no configuration at all,
+which is what makes 0.24.4's new warning on `acquire()` a real signal rather
+than a diagnostic a site has to opt into. Anything at DEBUG, such as the
+`reqwest::connect` records that reveal connection establishment, still needs
+`RUST_LOG` and so remains opt-in.
 
 **Failures became typed in 0.24.0.** Rust gained a `QrmiError` enum with a
 `.kind()` method, C gained `qrmi_get_last_error_kind()` and a return-code enum
@@ -2427,8 +2495,9 @@ what it speaks before relying on it.
 adding enum values behind unchanging function signatures, so a device library
 built against an older header keeps working and an updated caller learns what
 is missing through `NOTSUPPORTED`. QRMI adds capability by adding enum variants
-and trait methods, both of which are breaking changes, and offers no way to
-express partial support.
+and trait methods, both of which are breaking changes. That is the difference
+between an interface designed to be implemented by parties who release on their
+own schedule and one designed to be edited in place.
 
 That needs one qualification after the 0.24.0 recheck. QRMI grew an entire error
 taxonomy in that release and got it into Python additively, by having every new
@@ -2439,18 +2508,44 @@ enum. So the claim holds where QRMI is consumed as a Rust crate and does not
 hold where it is consumed through its Python bindings. The difference is not
 luck. It is that the Python surface had a pre-existing supertype to hang the new
 types under, which is the same trick QDMI's reserved enum space plays and an
-argument for designing that room in from the start. That is the difference between an interface designed
-to be implemented by parties who release on their own schedule and one designed
-to be edited in place.
+argument for designing that room in from the start.
 
-**The monolithic trait is the root of several findings elsewhere.** The axis
+**The half of that claim about partial support no longer holds at all.** This
+axis said QRMI offers no way to express it. QRMI 0.24.4 added default
+implementations to every `QuantumResource` method, each returning a new
+`UnsupportedFunction` error carrying the name of the method. A vendor now
+overrides what its backend supports and leaves the rest, and a caller receives
+a typed answer naming what was not supported. That is the same capability
+QDMI's `NOTSUPPORTED` provides, reached from the opposite starting point, and
+the upstream issue proposing it cites this report.
+
+Two things are worth keeping about how it arrived. It was added additively, in
+the way the paragraph above describes, so existing vendor implementations
+compile unchanged and can drop their no-op methods at their own pace. And the
+mechanism is not yet applied to the case that motivated it. `acquire` and
+`release` keep a default that warns and returns success rather than
+`UnsupportedFunction`, for backward compatibility, which Admission records in
+detail. A specification can learn from both halves. The room to express absence
+should exist from the start, because retrofitting it is easy, and the callers
+who have already built on a dishonest answer are what make using it hard.
+
+**The monolithic trait was the root of several findings elsewhere.** The axis
 description asks whether provider implementations can evolve without treating
-the interface as one monolith. QRMI's twelve-method trait is exactly that
-monolith: every backend must present every method, so methods that are
-meaningless for a backend become no-ops rather than honest absences. The
+the interface as one monolith. QRMI's twelve-method trait was exactly that
+monolith: every backend had to present every method, so methods that are
+meaningless for a backend became no-ops rather than honest absences. The
 `acquire()` divergence under Admission and the missing capability advertisement
 under Device Discovery are not three separate oversights — they are one design
 choice observed from three directions.
+
+The trait defaults in 0.24.4 remove the requirement that produced this. A
+method a backend does not support can now be left alone. What they do not
+remove is the second half, which was capability advertisement: a caller still
+learns that a method is unsupported by calling it and catching the result,
+rather than by asking in advance. Discovering capability by invocation is
+workable for an idempotent query and not for anything that acquires, submits or
+cancels. So of the three directions this one design choice was visible from,
+one has closed and two remain.
 
 **Reserved custom slots are extensibility without portability, and there is now
 a concrete case.** QDMI's five `CUSTOM` slots per family let a vendor expose
